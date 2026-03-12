@@ -1,0 +1,27 @@
+---
+source: truesight/src/app.rs
+assertion_line: 706
+expression: sanitized
+---
+repo_root: <REPO_ROOT>
+branch: main
+modules: 1
+
+## src
+path: src
+files:
+  - index.ts
+  - utils.ts
+symbols:
+  - IUser [interface] index.ts:6 interface IUser
+  - ValidationResult [constant] index.ts:15 type ValidationResult =
+  - AuthService [class] index.ts:20 class AuthService
+  - login [method] index.ts:26 public async login(email: string, password: string): Promise<boolean>
+  - logout [method] index.ts:37 public logout(): void
+  - isAuthenticated [method] index.ts:44 public isAuthenticated(): boolean
+  - validateEmail [function] index.ts:52 function validateEmail(email: string): boolean
+  - createUser [function] index.ts:59 function createUser(name: string, email: string): IUser
+  - calculateChecksum [function] index.ts:70 function calculateChecksum(data: Uint8Array): number
+  - formatName [function] utils.ts:4 function formatName(name: string): string
+  - truncateText [function] utils.ts:24 function truncateText(text: string, maxLen: number): string
+  - isBlank [function] utils.ts:34 function isBlank(s: string): boolean

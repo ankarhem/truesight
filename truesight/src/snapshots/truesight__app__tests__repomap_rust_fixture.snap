@@ -1,0 +1,27 @@
+---
+source: truesight/src/app.rs
+assertion_line: 684
+expression: sanitized
+---
+repo_root: <REPO_ROOT>
+branch: main
+modules: 1
+
+## src
+path: src
+files:
+  - lib.rs
+  - utils.rs
+symbols:
+  - User [struct] lib.rs:8 pub struct User
+  - ValidationError [enum] lib.rs:15 pub enum ValidationError
+  - Validatable [trait] lib.rs:22 pub trait Validatable
+  - validate [method] lib.rs:23 fn validate(&self) -> Result<(), ValidationError>
+  - new [method] lib.rs:28 pub fn new(id: u64, name: &str, email: &str) -> Self
+  - display_name [method] lib.rs:37 pub fn display_name(&self) -> String
+  - validate [method] lib.rs:43 fn validate(&self) -> Result<(), ValidationError>
+  - validate_email [function] lib.rs:58 pub fn validate_email(email: &str) -> bool
+  - calculate_checksum [function] lib.rs:63 pub fn calculate_checksum(data: &[u8]) -> u32
+  - format_name [function] utils.rs:4 pub fn format_name(name: &str) -> String
+  - truncate_text [function] utils.rs:22 pub fn truncate_text(text: &str, max_len: usize) -> String
+  - is_blank [function] utils.rs:31 pub fn is_blank(s: &str) -> bool

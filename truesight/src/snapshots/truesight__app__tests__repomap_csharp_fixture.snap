@@ -1,0 +1,44 @@
+---
+source: truesight/src/app.rs
+assertion_line: 695
+expression: sanitized
+---
+repo_root: <REPO_ROOT>
+branch: main
+modules: 3
+
+## repo
+path: .
+files:
+  - Program.cs
+symbols:
+  - Program [class] Program.cs:10 public class Program
+  - AppStatus [enum] Program.cs:15 public enum AppStatus
+  - Main [method] Program.cs:25 public static void Main(string[] args)
+  - ValidateArgs [method] Program.cs:34 public static bool ValidateArgs(string[] args)
+  - ParseConfig [method] Program.cs:42 public static string ParseConfig(string[] args)
+
+## Models
+path: Models
+files:
+  - User.cs
+symbols:
+  - User [class] User.cs:8 public class User
+  - Id [constant] User.cs:13 public long Id
+  - Name [constant] User.cs:18 public string Name
+  - Email [constant] User.cs:23 public string Email
+  - Status [constant] User.cs:28 public UserStatus Status
+  - GetDisplayName [method] User.cs:33 public string GetDisplayName()
+  - UserStatus [enum] User.cs:42 public enum UserStatus
+
+## Services
+path: Services
+files:
+  - AuthService.cs
+symbols:
+  - AuthService [class] AuthService.cs:8 public class AuthService
+  - Login [method] AuthService.cs:15 public bool Login(string email, string password)
+  - Logout [method] AuthService.cs:28 public void Logout()
+  - IsAuthenticated [method] AuthService.cs:36 public bool IsAuthenticated()
+  - ValidateEmail [method] AuthService.cs:44 public static bool ValidateEmail(string email)
+  - IAuthProvider [interface] AuthService.cs:53 public interface IAuthProvider
