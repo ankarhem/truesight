@@ -1,0 +1,30 @@
+[package]
+name = "truesight-engine"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+async-trait = "0.1"
+chrono = "0.4"
+truesight-core = { path = "../truesight-core" }
+ndarray = "0.17.2"
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-c-sharp = "0.23"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["api-23", "load-dynamic", "ndarray"] }
+tokenizers = "0.19"
+walkdir = "2"
+ignore = "0.4"
+rayon = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+sha2 = "0.10"
+tracing = "0.1"
+
+[dev-dependencies]
+async-trait = "0.1"
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
