@@ -1,36 +1,30 @@
-use std::fs;
-use std::path::PathBuf;
+use std::env;
+use std::path::Path;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
+
     if !cfg!(target_os = "linux") {
         return;
     }
 
-    let Ok(entries) = fs::read_dir("/nix/store") else {
+    let Some(paths) = env::var_os("LD_LIBRARY_PATH") else {
         return;
     };
 
-    let mut runtime_dirs = entries
-        .filter_map(|entry| entry.ok().map(|item| item.path()))
-        .filter_map(runtime_lib_dir)
-        .collect::<Vec<_>>();
+    let mut seen = Vec::new();
+    for dir in env::split_paths(&paths) {
+        if seen.iter().any(|seen_dir| seen_dir == &dir) {
+            continue;
+        }
 
-    runtime_dirs.sort();
-    runtime_dirs.dedup();
-
-    for dir in runtime_dirs {
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+        add_runtime_rpath(dir.as_path());
+        seen.push(dir);
     }
 }
 
-fn runtime_lib_dir(path: PathBuf) -> Option<PathBuf> {
-    let name = path.file_name()?.to_str()?;
-    let lib_dir = path.join("lib");
-
-    let has_runtime_lib = (name.contains("gcc-")
-        && name.ends_with("-lib")
-        && lib_dir.join("libstdc++.so.6").exists())
-        || (name.starts_with("openssl-") && lib_dir.join("libssl.so.3").exists());
-
-    has_runtime_lib.then_some(lib_dir)
+fn add_runtime_rpath(dir: &Path) {
+    if dir.is_dir() {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+    }
 }

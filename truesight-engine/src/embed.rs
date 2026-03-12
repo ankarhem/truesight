@@ -154,9 +154,8 @@ impl OnnxEmbedder {
     }
 
     fn initialize_ort_environment() -> Result<()> {
-        let (path, source) = Self::resolve_ort_dylib_path()?;
+        let (path, _) = Self::resolve_ort_dylib_path()?;
         env::set_var("ORT_DYLIB_PATH", &path);
-        let _ = source;
         Ok(())
     }
 
@@ -176,7 +175,7 @@ impl OnnxEmbedder {
         }
 
         Err(TruesightError::Embedding(
-            "ONNX Runtime dylib path is not configured; set ORT_DYLIB_PATH or rebuild with a valid TRUESIGHT_ORT_DYLIB"
+            "ONNX Runtime dylib path is not configured; set ORT_DYLIB_PATH (for example via `nix develop`) or rebuild with a valid TRUESIGHT_ORT_DYLIB"
                 .to_string(),
         ))
     }
