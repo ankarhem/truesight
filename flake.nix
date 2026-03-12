@@ -53,7 +53,6 @@
                 cargo-edit
                 cargo-watch
                 openssl
-                onnxruntime
                 pkg-config
                 rust-analyzer
               ]
@@ -61,14 +60,6 @@
 
             env = {
               RUST_SRC_PATH = "${pkgs.rustToolchain}/lib/rustlib/src/rust/library";
-            }
-            // lib.optionalAttrs pkgs.stdenv.isLinux {
-              ORT_DYLIB_PATH = "${pkgs.onnxruntime}/lib/libonnxruntime.so";
-              LD_LIBRARY_PATH = lib.makeLibraryPath [
-                pkgs.onnxruntime
-                pkgs.openssl
-                pkgs.stdenv.cc.cc.lib
-              ];
             };
           };
           _module.args.pkgs = import inputs.nixpkgs {

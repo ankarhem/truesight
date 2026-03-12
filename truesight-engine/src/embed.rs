@@ -39,7 +39,6 @@ pub struct OnnxEmbedder {
 impl OnnxEmbedder {
     pub fn new() -> Result<Self> {
         let assets = Self::ensure_model()?;
-        Self::initialize_ort_environment()?;
         let mut tokenizer = Tokenizer::from_file(&assets.tokenizer).map_err(|error| {
             TruesightError::Embedding(format!("failed to load tokenizer: {error}"))
         })?;
@@ -141,63 +140,30 @@ impl OnnxEmbedder {
     }
 
     fn ensure_model() -> Result<ModelAssets> {
-        let model_dir = Self::model_dir()?;
-        fs::create_dir_all(&model_dir)?;
+        // reqwest::blocking spawns an internal tokio runtime whose drop
+        // panics when called from an existing async context (macOS).
+        // Running on a dedicated OS thread avoids the nested-runtime conflict.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let model_dir = Self::model_dir()?;
+                fs::create_dir_all(&model_dir)?;
 
-        let model = model_dir.join("model.onnx");
-        let tokenizer = model_dir.join("tokenizer.json");
+                let model = model_dir.join("model.onnx");
+                let tokenizer = model_dir.join("tokenizer.json");
 
-        Self::ensure_file(&model, MODEL_URL, MODEL_SHA256)?;
-        Self::ensure_file(&tokenizer, TOKENIZER_URL, TOKENIZER_SHA256)?;
+                Self::ensure_file(&model, MODEL_URL, MODEL_SHA256)?;
+                Self::ensure_file(&tokenizer, TOKENIZER_URL, TOKENIZER_SHA256)?;
 
-        Ok(ModelAssets { model, tokenizer })
+                Ok(ModelAssets { model, tokenizer })
+            })
+            .join()
+            .unwrap_or_else(|_| {
+                Err(TruesightError::Embedding(
+                    "model download thread panicked".into(),
+                ))
+            })
+        })
     }
-
-    fn initialize_ort_environment() -> Result<()> {
-        let (path, _) = Self::resolve_ort_dylib_path()?;
-        env::set_var("ORT_DYLIB_PATH", &path);
-        Ok(())
-    }
-
-    fn resolve_ort_dylib_path() -> Result<(PathBuf, &'static str)> {
-        if let Some(path) = env::var_os("ORT_DYLIB_PATH") {
-            return Ok((
-                Self::validate_ort_dylib_path(PathBuf::from(path), "ORT_DYLIB_PATH")?,
-                "ORT_DYLIB_PATH",
-            ));
-        }
-
-        if let Some(path) = option_env!("TRUESIGHT_ORT_DYLIB") {
-            return Ok((
-                Self::validate_ort_dylib_path(PathBuf::from(path), "TRUESIGHT_ORT_DYLIB")?,
-                "TRUESIGHT_ORT_DYLIB",
-            ));
-        }
-
-        Err(TruesightError::Embedding(
-            "ONNX Runtime dylib path is not configured; set ORT_DYLIB_PATH (for example via `nix develop`) or rebuild with a valid TRUESIGHT_ORT_DYLIB"
-                .to_string(),
-        ))
-    }
-
-    fn validate_ort_dylib_path(path: PathBuf, source: &str) -> Result<PathBuf> {
-        let canonical = path.canonicalize().map_err(|error| {
-            TruesightError::Embedding(format!(
-                "failed to resolve ONNX Runtime dylib from {source} at {}: {error}",
-                path.display()
-            ))
-        })?;
-
-        if canonical.is_file() {
-            Ok(canonical)
-        } else {
-            Err(TruesightError::Embedding(format!(
-                "resolved ONNX Runtime dylib from {source} is not a file: {}",
-                canonical.display()
-            )))
-        }
-    }
-
     fn ensure_file(path: &Path, url: &str, expected_sha256: &str) -> Result<()> {
         if path.exists() {
             let actual_sha256 = Self::sha256_file(path)?;
