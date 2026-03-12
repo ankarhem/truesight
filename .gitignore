@@ -2,3 +2,4 @@
 *.swp
 .direnv/
 *.rs.bk
+.pre-commit-config.yaml
