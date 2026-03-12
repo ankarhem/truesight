@@ -1,0 +1,17 @@
+{
+  "symbols": [
+    {"name": "User", "kind": "struct"},
+    {"name": "ValidationError", "kind": "enum"},
+    {"name": "Validatable", "kind": "trait"},
+    {"name": "new", "kind": "method"},
+    {"name": "display_name", "kind": "method"},
+    {"name": "validate", "kind": "method"},
+    {"name": "validate_email", "kind": "function"},
+    {"name": "calculate_checksum", "kind": "function"},
+    {"name": "format_name", "kind": "function"},
+    {"name": "truncate_text", "kind": "function"},
+    {"name": "is_blank", "kind": "function"}
+  ],
+  "documented_symbols": ["User", "ValidationError", "Validatable", "new", "display_name", "validate", "validate_email", "calculate_checksum", "format_name", "truncate_text", "is_blank"],
+  "imports": ["use crate::utils::format_name"]
+}

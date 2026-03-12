@@ -1,0 +1,18 @@
+{
+  "symbols": [
+    {"name": "IUser", "kind": "interface"},
+    {"name": "ValidationResult", "kind": "type_alias"},
+    {"name": "AuthService", "kind": "class"},
+    {"name": "login", "kind": "method"},
+    {"name": "logout", "kind": "method"},
+    {"name": "isAuthenticated", "kind": "method"},
+    {"name": "validateEmail", "kind": "function"},
+    {"name": "createUser", "kind": "function"},
+    {"name": "calculateChecksum", "kind": "function"},
+    {"name": "formatName", "kind": "function"},
+    {"name": "truncateText", "kind": "function"},
+    {"name": "isBlank", "kind": "function"}
+  ],
+  "documented_symbols": ["IUser", "ValidationResult", "AuthService", "login", "logout", "isAuthenticated", "validateEmail", "createUser", "calculateChecksum", "formatName", "truncateText", "isBlank"],
+  "imports": ["formatName", "truncateText"]
+}

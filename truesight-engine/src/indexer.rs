@@ -230,8 +230,14 @@ struct ProcessedFile {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
+
+    mod git_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/test_support/git_fixture.rs"
+        ));
+    }
 
     use async_trait::async_trait;
     use tempfile::TempDir;
@@ -240,6 +246,7 @@ mod tests {
     };
 
     use super::*;
+    use git_fixture::{TempGitFixture, init_empty_git_repo};
 
     #[derive(Clone, Default)]
     struct RecordingStorage {
@@ -575,17 +582,13 @@ mod tests {
 
     fn git_repo_with_sources() -> TempDir {
         let temp_dir = TempDir::new().expect("temp dir should exist");
-        let init = Command::new("git")
-            .args(["init"])
-            .current_dir(temp_dir.path())
-            .output()
-            .expect("git init should succeed");
-        assert!(init.status.success());
+        init_empty_git_repo(temp_dir.path());
         temp_dir
     }
 
     async fn assert_fixture_index(fixture_name: &str, expected_files: u32, language: Language) {
-        let root = fixture_root(fixture_name);
+        let fixture = TempGitFixture::new(fixture_name);
+        let root = fixture.path_buf();
         let database = RecordingStorage::default();
         let context = detect_repo_context(&root).expect("fixture repo should resolve context");
         let stats = index_repo(&root, &database, &FakeEmbedder)
@@ -636,7 +639,7 @@ mod tests {
     }
 
     fn expected_symbol_names(fixture_name: &str) -> BTreeSet<String> {
-        let path = fixture_root(fixture_name).join("expected.json");
+        let path = git_fixture::fixture_path(fixture_name).join("expected.json");
         let value: serde_json::Value =
             serde_json::from_slice(&fs::read(path).expect("expected fixture should exist"))
                 .expect("expected fixture should parse");
@@ -652,13 +655,5 @@ mod tests {
                     .to_string()
             })
             .collect()
-    }
-
-    fn fixture_root(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("tests")
-            .join("fixtures")
-            .join(name)
     }
 }

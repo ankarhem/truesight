@@ -416,25 +416,33 @@ fn language_label(language: Language) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::OnceLock;
+
+    mod git_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/test_support/git_fixture.rs"
+        ));
+    }
 
     use tokio::sync::Mutex;
 
     use super::*;
     use crate::cli::{Cli, Commands, IndexArgs, SearchArgs};
+    use git_fixture::TempGitFixture;
 
     #[tokio::test]
     async fn index_command_indexes_fixture_and_reports_stats() {
         let _guard = test_lock().lock().await;
-        let fixture = fixture_repo_path("rust-fixture");
-        cleanup_repo_database(&fixture);
+        let fixture = TempGitFixture::new("rust-fixture");
+        cleanup_repo_database(fixture.path());
         let mut output = Vec::new();
 
         run(
             Cli {
                 command: Commands::Index(IndexArgs {
-                    path: fixture.clone(),
+                    path: fixture.path_buf(),
                     full: true,
                 }),
             },
@@ -458,14 +466,14 @@ mod tests {
     #[tokio::test]
     async fn search_command_returns_ranked_results_for_indexed_fixture() {
         let _guard = test_lock().lock().await;
-        let fixture = fixture_repo_path("csharp-fixture");
-        cleanup_repo_database(&fixture);
+        let fixture = TempGitFixture::new("csharp-fixture");
+        cleanup_repo_database(fixture.path());
         let mut index_output = Vec::new();
 
         run(
             Cli {
                 command: Commands::Index(IndexArgs {
-                    path: fixture.clone(),
+                    path: fixture.path_buf(),
                     full: true,
                 }),
             },
@@ -479,7 +487,7 @@ mod tests {
             Cli {
                 command: Commands::Search(SearchArgs {
                     query: "authenticate user".to_string(),
-                    repo: fixture,
+                    repo: fixture.path_buf(),
                     limit: 5,
                 }),
             },
@@ -497,15 +505,15 @@ mod tests {
     #[tokio::test]
     async fn search_command_suggests_indexing_when_repo_is_missing_metadata() {
         let _guard = test_lock().lock().await;
-        let fixture = fixture_repo_path("ts-fixture");
-        cleanup_repo_database(&fixture);
+        let fixture = TempGitFixture::new("ts-fixture");
+        cleanup_repo_database(fixture.path());
         let mut output = Vec::new();
 
         let error = run(
             Cli {
                 command: Commands::Search(SearchArgs {
                     query: "validate email".to_string(),
-                    repo: fixture,
+                    repo: fixture.path_buf(),
                     limit: 3,
                 }),
             },
@@ -562,14 +570,14 @@ mod tests {
     #[tokio::test]
     async fn search_command_rejects_empty_query_without_crashing() {
         let _guard = test_lock().lock().await;
-        let fixture = fixture_repo_path("rust-fixture");
-        cleanup_repo_database(&fixture);
+        let fixture = TempGitFixture::new("rust-fixture");
+        cleanup_repo_database(fixture.path());
 
         let mut index_output = Vec::new();
         run(
             Cli {
                 command: Commands::Index(IndexArgs {
-                    path: fixture.clone(),
+                    path: fixture.path_buf(),
                     full: true,
                 }),
             },
@@ -583,7 +591,7 @@ mod tests {
             Cli {
                 command: Commands::Search(SearchArgs {
                     query: String::new(),
-                    repo: fixture,
+                    repo: fixture.path_buf(),
                     limit: 3,
                 }),
             },
@@ -619,14 +627,6 @@ mod tests {
                 .then(|| value.trim().parse().ok())
                 .flatten()
         })
-    }
-
-    fn fixture_repo_path(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("tests")
-            .join("fixtures")
-            .join(name)
     }
 
     fn cleanup_repo_database(repo_root: &Path) {
