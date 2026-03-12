@@ -621,7 +621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_command_rejects_empty_query_without_crashing() {
+    async fn search_command_handles_blank_query_without_crashing() {
         let _guard = test_lock().lock().await;
         let fixture = TempGitFixture::new("rust-fixture");
         cleanup_repo_database(fixture.path());
@@ -640,7 +640,7 @@ mod tests {
         .expect("fixture should index before empty-query search");
 
         let mut output = Vec::new();
-        let error = run(
+        run(
             Cli {
                 command: Commands::Search(SearchArgs {
                     query: String::new(),
@@ -651,10 +651,7 @@ mod tests {
             &mut output,
         )
         .await
-        .expect_err("empty query should fail gracefully");
-
-        let message = error.to_string();
-        assert!(message.contains("database error") || message.contains("syntax error"));
+        .expect("empty query should not crash");
     }
 
     #[test]

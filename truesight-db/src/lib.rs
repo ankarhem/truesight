@@ -515,6 +515,11 @@ impl Storage for Database {
         query: &str,
         limit: usize,
     ) -> Result<Vec<RankedResult>> {
+        let sanitized = match sanitize_fts_query(query) {
+            Some(q) => q,
+            None => return Ok(Vec::new()),
+        };
+
         let connection = self.connect().await.map_err(TruesightError::from)?;
         let mut rows = connection
             .query(
@@ -539,7 +544,7 @@ impl Storage for Database {
                 ORDER BY score ASC, code_units._rowid ASC
                 LIMIT ?4
                 "#,
-                params![repo_id, branch, query, limit as i64],
+                params![repo_id, branch, sanitized, limit as i64],
             )
             .await
             .map_err(DatabaseError::from)?;
@@ -1004,6 +1009,29 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> Result<f32> {
     Ok(dot / (left_norm.sqrt() * right_norm.sqrt()))
 }
 
+/// Sanitize a user query for safe use in an FTS5 MATCH clause.
+///
+/// Each whitespace-separated token is wrapped in double quotes so the FTS5
+/// tokenizer processes it as a literal phrase. Internal double-quote characters
+/// are escaped by doubling them (`""`), which is FTS5's quoting convention.
+///
+/// Returns `None` when the query contains no usable tokens (empty / whitespace-only).
+fn sanitize_fts_query(query: &str) -> Option<String> {
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .map(|word| {
+            let escaped = word.replace('"', "\"\"");
+            format!("\"{}\"", escaped)
+        })
+        .collect();
+
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" "))
+    }
+}
+
 fn normalize_fts_score(raw_score: f32) -> f32 {
     let magnitude = if raw_score.is_sign_negative() {
         -raw_score
@@ -1027,6 +1055,7 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
 mod tests {
     use super::{
         Database, IndexedFileRecord, cosine_similarity, decode_embedding, encode_embedding,
+        sanitize_fts_query,
     };
     use chrono::Utc;
     use libsql::params;
@@ -1276,6 +1305,91 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn sanitize_fts_query_quotes_each_token() {
+        assert_eq!(
+            sanitize_fts_query("hello world"),
+            Some(r#""hello" "world""#.to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_fts_query_escapes_internal_double_quotes() {
+        // Input: say "hello"
+        // Tokens after split_whitespace: ["say", "\"hello\""]
+        // "hello" → replace " with "": ""hello"" → wrap: """"hello""""
+        assert_eq!(
+            sanitize_fts_query(r#"say "hello""#),
+            Some("\"say\" \"\"\"hello\"\"\"".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_fts_query_handles_question_mark() {
+        assert_eq!(
+            sanitize_fts_query("what languages are supported?"),
+            Some(r#""what" "languages" "are" "supported?""#.to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_fts_query_handles_fts_operators() {
+        assert_eq!(
+            sanitize_fts_query("foo* (bar) -baz"),
+            Some(r#""foo*" "(bar)" "-baz""#.to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_fts_query_returns_none_for_empty_input() {
+        assert_eq!(sanitize_fts_query(""), None);
+        assert_eq!(sanitize_fts_query("   "), None);
+    }
+
+    #[tokio::test]
+    async fn search_fts_handles_special_characters_without_error() {
+        let (_temp_dir, database) = open_temp_database().await;
+        let unit = sample_unit(
+            "supported_languages",
+            "src/lang.rs",
+            10,
+            "pub fn supported_languages() -> Vec<String> { vec![] }",
+        );
+
+        database
+            .store_code_units(REPO_ID, BRANCH, &[unit])
+            .await
+            .unwrap();
+
+        let results = database
+            .search_fts(REPO_ID, BRANCH, "supported?", 5)
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].unit.name, "supported_languages");
+
+        let results = database
+            .search_fts(REPO_ID, BRANCH, r#""supported""#, 5)
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+
+        let results = database
+            .search_fts(REPO_ID, BRANCH, "languages (supported)", 5)
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+
+        let results = database.search_fts(REPO_ID, BRANCH, "", 5).await.unwrap();
+        assert!(results.is_empty());
+
+        let results = database
+            .search_fts(REPO_ID, BRANCH, "   ", 5)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
     }
 
     #[tokio::test]
