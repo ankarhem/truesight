@@ -16,24 +16,20 @@ fn mcp_initialize_and_list_tools_reports_exact_contract() {
     assert_eq!(initialize["id"], 1);
     assert_eq!(initialize["result"]["protocolVersion"], "2025-03-26");
     assert_eq!(initialize["result"]["capabilities"]["tools"], json!({}));
+    assert!(initialize["result"]["instructions"]
+        .as_str()
+        .expect("instructions should be a string")
+        .contains("| `search_repo` | Default first step for exploratory codebase work when the exact file or symbol is unknown; ranked lexical + semantic search |"));
     assert!(
         initialize["result"]["instructions"]
             .as_str()
             .expect("instructions should be a string")
-            .contains("exactly three tools")
+            .contains("Recommended agent workflow:")
     );
-    assert!(
-        initialize["result"]["instructions"]
-            .as_str()
-            .expect("instructions should be a string")
-            .contains("pair it with grep")
-    );
-    assert!(
-        initialize["result"]["instructions"]
-            .as_str()
-            .expect("instructions should be a string")
-            .contains("Use search_repo first")
-    );
+    assert!(initialize["result"]["instructions"]
+        .as_str()
+        .expect("instructions should be a string")
+        .contains("3. Use `grep` alongside Truesight when you need exact strings, regex matches, or exhaustive literal confirmation."));
 
     server.notify_initialized();
 

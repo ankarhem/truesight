@@ -35,15 +35,15 @@ When running as an MCP server (`truesight mcp`), three tools are exposed:
 
 | Tool | Description |
 |------|-------------|
-| `search_repo` | Use first when you do not know where something lives yet; ranked lexical + semantic search that pairs well with grep for exact text confirmation |
+| `search_repo` | Default first step for exploratory codebase work when the exact file or symbol is unknown; ranked lexical + semantic search |
 | `repo_map` | Use after search when you need module boundaries, key symbols, and dependency context; pass `filter` to focus on a repo-relative directory or file |
 | `index_repo` | Refresh or repair the index when search results are missing, stale, or after major repository changes |
 
 Recommended agent workflow:
 
 1. Start with `search_repo` when the location is unknown or you want likely implementations ranked for you.
-2. Use `grep` alongside Truesight when you need exact strings, regex matches, or exhaustive literal confirmation.
-3. Use `repo_map` once search has narrowed the area and you want structural context; add `filter` when you already know the relevant directory or file.
+2. Use `repo_map` once search has narrowed the area and you want structural context; add `filter` when you already know the relevant directory or file.
+3. Use `grep` alongside Truesight when you need exact strings, regex matches, or exhaustive literal confirmation.
 4. Use `index_repo` only when the repository changed substantially or search data needs a refresh.
 
 ## Architecture

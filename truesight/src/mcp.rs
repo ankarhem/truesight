@@ -327,7 +327,19 @@ impl From<IndexRepoStats> for IndexRepoStatsResponse {
 impl ServerHandler for TruesightMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Truesight exposes exactly three tools: search_repo, repo_map, and index_repo. Use search_repo first when you do not know where something lives and want ranked semantic plus lexical code search; pair it with grep when you need exact string or regex confirmation. Use repo_map after search when you need module boundaries, key symbols, and dependency context, and pass a filter when you want to focus on a specific repo-relative directory or file. Use index_repo only to refresh or repair search data when results are missing, stale, or after major repository changes.",
+            r#"
+| Tool | Description |
+|------|-------------|
+| `search_repo` | Default first step for exploratory codebase work when the exact file or symbol is unknown; ranked lexical + semantic search |
+| `repo_map` | Use after search when you need module boundaries, key symbols, and dependency context; pass `filter` to focus on a repo-relative directory or file |
+| `index_repo` | Refresh or repair the index when search results are missing, stale, or after major repository changes |
+
+Recommended agent workflow:
+
+1. Start with `search_repo` when the location is unknown or you want likely implementations ranked for you.
+2. Use `repo_map` once search has narrowed the area and you want structural context; add `filter` when you already know the relevant directory or file.
+3. Use `grep` alongside Truesight when you need exact strings, regex matches, or exhaustive literal confirmation.
+4. Use `index_repo` only when the repository changed substantially or search data needs a refresh."#,
         )
     }
 }
