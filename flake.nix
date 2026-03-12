@@ -34,7 +34,42 @@
           system,
           ...
         }:
+        let
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = pkgs.rustToolchain;
+            rustc = pkgs.rustToolchain;
+          };
+
+          truesight = rustPlatform.buildRustPackage {
+            pname = "truesight";
+            version = "0.1.0";
+            src = ./.;
+
+            cargoLock.lockFile = ./Cargo.lock;
+
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              cmake
+            ];
+
+            buildInputs = with pkgs; [
+              openssl
+              onnxruntime
+            ];
+
+            doCheck = false;
+
+            postFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+              install_name_tool -add_rpath "${pkgs.onnxruntime}/lib" "$out/bin/truesight"
+            '';
+
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            ORT_LIB_PATH = "${pkgs.onnxruntime}/lib";
+            ORT_PREFER_DYNAMIC_LINK = "1";
+          };
+        in
         {
+          packages.default = truesight;
           treefmt = {
             programs.nixfmt.enable = true;
             programs.nixfmt.package = pkgs.nixfmt;
