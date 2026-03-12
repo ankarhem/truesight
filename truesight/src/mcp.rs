@@ -100,7 +100,9 @@ impl TruesightMcp {
         Ok(Json(repo_map.into()))
     }
 
-    #[tool(description = "Search the repository with hybrid lexical and semantic ranking")]
+    #[tool(
+        description = "Search when you do not know the exact location yet; best for ranked symbol lookup, semantic code discovery, and pairing with grep for exact text checks"
+    )]
     async fn search_repo(
         &self,
         Parameters(SearchRepoRequest { query, path, limit }): Parameters<SearchRepoRequest>,
@@ -113,7 +115,9 @@ impl TruesightMcp {
         Ok(Json(response.into()))
     }
 
-    #[tool(description = "Index or refresh a repository so search_repo and repo_map stay current")]
+    #[tool(
+        description = "Refresh repository search data when results are missing or stale; use this to repair or warm the index for search_repo and repo_map"
+    )]
     async fn index_repo(
         &self,
         Parameters(IndexRepoRequest { path, full }): Parameters<IndexRepoRequest>,
@@ -319,7 +323,7 @@ impl From<IndexRepoStats> for IndexRepoStatsResponse {
 impl ServerHandler for TruesightMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Truesight indexes local repositories and exposes exactly three tools: index_repo, search_repo, and repo_map.",
+            "Truesight exposes exactly three tools: search_repo, repo_map, and index_repo. Use search_repo first when you do not know where something lives and want ranked semantic plus lexical code search; pair it with grep when you need exact string or regex confirmation. Use repo_map after search when you need module boundaries, key symbols, and dependency context. Use index_repo only to refresh or repair search data when results are missing, stale, or after major repository changes.",
         )
     }
 }

@@ -22,6 +22,18 @@ fn mcp_initialize_and_list_tools_reports_exact_contract() {
             .expect("instructions should be a string")
             .contains("exactly three tools")
     );
+    assert!(
+        initialize["result"]["instructions"]
+            .as_str()
+            .expect("instructions should be a string")
+            .contains("pair it with grep")
+    );
+    assert!(
+        initialize["result"]["instructions"]
+            .as_str()
+            .expect("instructions should be a string")
+            .contains("Use search_repo first")
+    );
 
     server.notify_initialized();
 
