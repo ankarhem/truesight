@@ -4,3 +4,4 @@
 *.rs.bk
 .pre-commit-config.yaml
 .codemogger
+result
