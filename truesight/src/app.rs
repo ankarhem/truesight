@@ -15,7 +15,7 @@ use truesight_engine::{
     detect_repo_context, index_repo,
 };
 
-use crate::cli::{Cli, Commands, IndexArgs, SearchArgs};
+use crate::cli::{Cli, Commands, IndexArgs, RepoMapArgs, SearchArgs};
 
 const STALE_INDEX_MAX_AGE_MINUTES: i64 = 5;
 
@@ -179,6 +179,7 @@ pub(crate) async fn run(cli: Cli, writer: &mut dyn Write) -> anyhow::Result<()> 
         Commands::Mcp => crate::mcp::run().await,
         Commands::Index(args) => run_index(&app, args, writer).await,
         Commands::Search(args) => run_search(&app, args, writer).await,
+        Commands::RepoMap(args) => run_repomap(&app, args, writer).await,
     }
 }
 
@@ -200,6 +201,15 @@ async fn run_search(
         .search_repo_for_cli(args.repo, args.query, args.limit)
         .await?;
     write_search_output(writer, &response)
+}
+
+async fn run_repomap(
+    app: &AppServices,
+    args: RepoMapArgs,
+    writer: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let response = app.repo_map_response(args.path).await?;
+    write_repomap_output(writer, &response)
 }
 
 async fn open_database(repo_root: &Path) -> anyhow::Result<Database> {
@@ -294,6 +304,46 @@ fn write_search_output(
     Ok(())
 }
 
+fn write_repomap_output(writer: &mut dyn Write, response: &RepoMap) -> anyhow::Result<()> {
+    writeln!(writer, "repo_root: {}", response.repo_root.display())?;
+    writeln!(writer, "branch: {}", response.branch)?;
+    writeln!(writer, "modules: {}", response.modules.len())?;
+
+    for module in &response.modules {
+        let module_path = display_path(&response.repo_root, &module.path);
+        writeln!(writer, "\n## {}", module.name)?;
+        writeln!(writer, "path: {module_path}")?;
+
+        if !module.files.is_empty() {
+            writeln!(writer, "files:")?;
+            for file in &module.files {
+                writeln!(writer, "  - {file}")?;
+            }
+        }
+
+        if !module.symbols.is_empty() {
+            writeln!(writer, "symbols:")?;
+            for sym in &module.symbols {
+                writeln!(
+                    writer,
+                    "  - {} [{}] {}:{} {}",
+                    sym.name,
+                    kind_label_raw(sym.kind),
+                    sym.file,
+                    sym.line,
+                    sym.signature.trim()
+                )?;
+            }
+        }
+
+        if !module.depends_on.is_empty() {
+            writeln!(writer, "depends_on: {}", module.depends_on.join(", "))?;
+        }
+    }
+
+    Ok(())
+}
+
 fn display_path(repo_root: &Path, path: &Path) -> String {
     if path.is_absolute() {
         path.strip_prefix(repo_root)
@@ -309,7 +359,11 @@ fn single_line(text: &str) -> String {
 }
 
 fn kind_label(result: &SearchResult) -> &'static str {
-    match result.kind {
+    kind_label_raw(result.kind)
+}
+
+fn kind_label_raw(kind: truesight_core::CodeUnitKind) -> &'static str {
+    match kind {
         truesight_core::CodeUnitKind::Function => "function",
         truesight_core::CodeUnitKind::Method => "method",
         truesight_core::CodeUnitKind::Struct => "struct",
@@ -429,7 +483,6 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::cli::{Cli, Commands, IndexArgs, SearchArgs};
     use git_fixture::TempGitFixture;
 
     #[tokio::test]
@@ -618,6 +671,61 @@ mod tests {
         assert!(should_refresh_index(&metadata, Some("new")));
         assert!(!should_refresh_index(&metadata, Some("old")));
         assert!(!should_refresh_index(&metadata, None));
+    }
+
+    #[tokio::test]
+    async fn repomap_rust_fixture_snapshot() {
+        let _guard = test_lock().lock().await;
+        let fixture = TempGitFixture::new("rust-fixture");
+        cleanup_repo_database(fixture.path());
+
+        let output = run_repomap_for_fixture(&fixture).await;
+        let sanitized = sanitize_paths(&output, fixture.path());
+        insta::assert_snapshot!("repomap_rust_fixture", sanitized);
+    }
+
+    #[tokio::test]
+    async fn repomap_csharp_fixture_snapshot() {
+        let _guard = test_lock().lock().await;
+        let fixture = TempGitFixture::new("csharp-fixture");
+        cleanup_repo_database(fixture.path());
+
+        let output = run_repomap_for_fixture(&fixture).await;
+        let sanitized = sanitize_paths(&output, fixture.path());
+        insta::assert_snapshot!("repomap_csharp_fixture", sanitized);
+    }
+
+    #[tokio::test]
+    async fn repomap_ts_fixture_snapshot() {
+        let _guard = test_lock().lock().await;
+        let fixture = TempGitFixture::new("ts-fixture");
+        cleanup_repo_database(fixture.path());
+
+        let output = run_repomap_for_fixture(&fixture).await;
+        let sanitized = sanitize_paths(&output, fixture.path());
+        insta::assert_snapshot!("repomap_ts_fixture", sanitized);
+    }
+
+    async fn run_repomap_for_fixture(fixture: &TempGitFixture) -> String {
+        let mut output = Vec::new();
+        run(
+            Cli {
+                command: Commands::RepoMap(RepoMapArgs {
+                    path: fixture.path_buf(),
+                }),
+            },
+            &mut output,
+        )
+        .await
+        .expect("repomap command should succeed");
+        String::from_utf8(output).expect("repomap output should be utf-8")
+    }
+
+    fn sanitize_paths(output: &str, repo_root: &Path) -> String {
+        let canonical = repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.to_path_buf());
+        output.replace(canonical.to_str().unwrap(), "<REPO_ROOT>")
     }
 
     fn parse_numeric_field(output: &str, name: &str) -> Option<u64> {

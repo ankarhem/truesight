@@ -14,6 +14,7 @@ pub enum Commands {
     Mcp,
     Index(IndexArgs),
     Search(SearchArgs),
+    RepoMap(RepoMapArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -30,6 +31,12 @@ pub struct SearchArgs {
     pub repo: PathBuf,
     #[arg(long, default_value_t = 10)]
     pub limit: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RepoMapArgs {
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
 }
 
 #[cfg(test)]
