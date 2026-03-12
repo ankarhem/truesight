@@ -76,6 +76,16 @@ nix build
 cargo build --release
 ```
 
+## Install
+
+### With Cargo
+
+```bash
+cargo install --path truesight
+```
+
+After installation, the `truesight` binary will be available on your `PATH`.
+
 > **Note:** The `ort` crate requires ONNX Runtime. When building with cargo outside of Nix, it will download the binaries automatically.
 
 ## Development
