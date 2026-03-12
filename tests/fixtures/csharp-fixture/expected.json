@@ -1,0 +1,24 @@
+{
+  "symbols": [
+    {"name": "Program", "kind": "class"},
+    {"name": "AppStatus", "kind": "enum"},
+    {"name": "Main", "kind": "method"},
+    {"name": "ValidateArgs", "kind": "method"},
+    {"name": "ParseConfig", "kind": "method"},
+    {"name": "AuthService", "kind": "class"},
+    {"name": "Login", "kind": "method"},
+    {"name": "Logout", "kind": "method"},
+    {"name": "IsAuthenticated", "kind": "method"},
+    {"name": "ValidateEmail", "kind": "method"},
+    {"name": "IAuthProvider", "kind": "interface"},
+    {"name": "User", "kind": "class"},
+    {"name": "Id", "kind": "property"},
+    {"name": "Name", "kind": "property"},
+    {"name": "Email", "kind": "property"},
+    {"name": "Status", "kind": "property"},
+    {"name": "GetDisplayName", "kind": "method"},
+    {"name": "UserStatus", "kind": "enum"}
+  ],
+  "documented_symbols": ["Program", "AppStatus", "Main", "ValidateArgs", "ParseConfig", "AuthService", "Login", "Logout", "IsAuthenticated", "ValidateEmail", "IAuthProvider", "User", "Id", "Name", "Email", "Status", "GetDisplayName", "UserStatus"],
+  "imports": ["AuthService", "User"]
+}
