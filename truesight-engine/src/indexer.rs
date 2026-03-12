@@ -8,7 +8,8 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 use truesight_core::{
-    CodeUnit, Embedder, IndexMetadata, IndexStats, IndexStorage, IndexedCodeUnit, Language, Result,
+    CodeUnit, Embedder, IndexMetadata, IndexStats, IndexStorage, IndexedCodeUnit,
+    IndexedFileRecord, Language, Result,
 };
 
 use crate::parser::CodeParser;
@@ -74,10 +75,6 @@ where
         let discovered = self.walker.walk(root)?;
         let files_scanned = discovered.len() as u32;
 
-        storage
-            .delete_branch_index(&context.repo_id, &context.branch)
-            .await?;
-
         let processed = discovered
             .par_iter()
             .enumerate()
@@ -108,35 +105,32 @@ where
             indexed_units.extend(file.units.iter().cloned());
         }
 
-        if !indexed_units.is_empty() {
-            storage
-                .store_indexed_units(&context.repo_id, &context.branch, &indexed_units)
-                .await?;
-        }
+        let indexed_files = processed
+            .iter()
+            .filter(|file| !file.units.is_empty())
+            .map(|file| IndexedFileRecord {
+                file_path: file.path.clone(),
+                file_hash: file.file_hash.clone(),
+                indexed_at: Utc::now(),
+            })
+            .collect::<Vec<_>>();
 
-        for file in processed.iter().filter(|file| !file.units.is_empty()) {
-            storage
-                .upsert_indexed_file(
-                    &context.repo_id,
-                    &context.branch,
-                    &file.path,
-                    &file.file_hash,
-                )
-                .await?;
-        }
+        let metadata = IndexMetadata {
+            repo_id: context.repo_id.clone(),
+            branch: context.branch.clone(),
+            last_indexed_at: Utc::now(),
+            last_commit_sha: context.last_commit_sha.clone(),
+            file_count: files_indexed,
+            symbol_count: symbols_extracted,
+        };
 
         storage
-            .set_index_metadata(
+            .replace_branch_index(
                 &context.repo_id,
                 &context.branch,
-                &IndexMetadata {
-                    repo_id: context.repo_id.clone(),
-                    branch: context.branch.clone(),
-                    last_indexed_at: Utc::now(),
-                    last_commit_sha: context.last_commit_sha.clone(),
-                    file_count: files_indexed,
-                    symbol_count: symbols_extracted,
-                },
+                &indexed_units,
+                &indexed_files,
+                &metadata,
             )
             .await?;
 

@@ -362,6 +362,28 @@ pub trait IndexStorage: Storage {
         file_path: &Path,
         file_hash: &str,
     ) -> Result<()>;
+
+    async fn replace_branch_index(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        units: &[IndexedCodeUnit],
+        indexed_files: &[IndexedFileRecord],
+        metadata: &IndexMetadata,
+    ) -> Result<()> {
+        self.delete_branch_index(repo_id, branch).await?;
+
+        if !units.is_empty() {
+            self.store_indexed_units(repo_id, branch, units).await?;
+        }
+
+        for file in indexed_files {
+            self.upsert_indexed_file(repo_id, branch, &file.file_path, &file.file_hash)
+                .await?;
+        }
+
+        self.set_index_metadata(repo_id, branch, metadata).await
+    }
 }
 
 #[async_trait]

@@ -165,6 +165,72 @@ fn mcp_index_and_repo_map_tool_calls_work_over_real_stdio_transport() {
     cleanup_repo_database(&fixture);
 }
 
+#[test]
+fn mcp_search_stays_consistent_during_full_reindex() {
+    let repo = workspace_repo();
+    cleanup_repo_database(&repo);
+
+    let mut server = McpServer::spawn();
+    server.initialize();
+    server.notify_initialized();
+
+    server.send_request(
+        2,
+        "tools/call",
+        json!({
+            "name": "index_repo",
+            "arguments": {
+                "path": repo.display().to_string(),
+                "full": true,
+            }
+        }),
+    );
+
+    for request_id in 3..13 {
+        server.send_request(
+            request_id,
+            "tools/call",
+            json!({
+                "name": "search_repo",
+                "arguments": {
+                    "path": repo.display().to_string(),
+                    "query": "mcp schema format uint32",
+                    "limit": 5,
+                }
+            }),
+        );
+    }
+
+    let mut search_totals = Vec::new();
+    for _ in 0..11 {
+        let response = server.read_response();
+        assert_eq!(response["jsonrpc"], "2.0");
+
+        if response["id"] == 2 {
+            assert_eq!(response["result"]["isError"], false);
+            continue;
+        }
+
+        assert_eq!(
+            response["result"]["isError"], false,
+            "unexpected overlapping search error response: {response}"
+        );
+        search_totals.push(
+            response["result"]["structuredContent"]["total_results"]
+                .as_u64()
+                .expect("search result count should be present"),
+        );
+    }
+
+    assert_eq!(search_totals.len(), 10);
+    assert!(
+        search_totals.iter().all(|count| *count > 0),
+        "overlapping search should not observe an empty index: {search_totals:?}"
+    );
+
+    cleanup_repo_database(&repo);
+}
+
 struct McpServer {
     child: Child,
     stdin: ChildStdin,
@@ -222,13 +288,20 @@ impl McpServer {
     }
 
     fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
+        self.send_request(id, method, params);
+        self.read_response()
+    }
+
+    fn send_request(&mut self, id: u64, method: &str, params: Value) {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
             "params": params,
         }));
+    }
 
+    fn read_response(&mut self) -> Value {
         let mut line = String::new();
         let bytes = self
             .stdout
@@ -276,9 +349,18 @@ fn rust_fixture_repo() -> PathBuf {
         .expect("fixture path should resolve")
 }
 
+fn workspace_repo() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .canonicalize()
+        .expect("workspace path should resolve")
+}
+
 fn cleanup_repo_database(repo_root: &Path) {
     if let Ok(db_path) = Database::db_path_for_repo(repo_root) {
-        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = fs::remove_file(format!("{}-shm", db_path.display()));
     }
 }
 

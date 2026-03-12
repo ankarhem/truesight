@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration as StdDuration;
 
 use anyhow::{Context, anyhow};
 use chrono::{Duration, Utc};
@@ -18,6 +21,13 @@ use truesight_engine::{
 use crate::cli::{Cli, Commands, IndexArgs, RepoMapArgs, SearchArgs};
 
 const STALE_INDEX_MAX_AGE_MINUTES: i64 = 5;
+const INDEXING_WAIT_RETRIES: usize = 600;
+const INDEXING_WAIT_INTERVAL_MS: u64 = 100;
+const INDEXING_MARKER_STALE_SECS: u64 = 300;
+const SEARCH_RETRY_ATTEMPTS: usize = 10;
+static REPO_OPERATION_LOCKS: OnceLock<
+    tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AppServices;
@@ -33,6 +43,16 @@ impl AppServices {
         full: bool,
     ) -> anyhow::Result<IndexRepoResponse> {
         let repo_root = canonicalize_repo_root(&path)?;
+        let _guard = lock_repo_operation(&repo_root).await;
+        self.index_repo_response_from_root(repo_root, full).await
+    }
+
+    async fn index_repo_response_from_root(
+        &self,
+        repo_root: PathBuf,
+        full: bool,
+    ) -> anyhow::Result<IndexRepoResponse> {
+        let _marker = acquire_indexing_marker(&repo_root).await?;
         let context = detect_repo_context(&repo_root)?;
         let database = open_database(&repo_root).await?;
         let embedder = OnnxEmbedder::new().context("failed to initialize embedder")?;
@@ -83,22 +103,8 @@ impl AppServices {
         limit: usize,
     ) -> anyhow::Result<SearchRepoResponse> {
         let repo_root = canonicalize_repo_root(&path)?;
-        let context = detect_repo_context(&repo_root)?;
-        let database = open_database(&repo_root).await?;
-        let metadata =
-            Storage::get_index_metadata(&database, &context.repo_id, &context.branch).await?;
-
-        if metadata.is_none()
-            && !branch_has_index(&database, &context.repo_id, &context.branch).await?
-        {
-            return Err(anyhow!(
-                "repository is not indexed for branch `{}`; run `truesight index {}` first",
-                context.branch,
-                repo_root.display()
-            ));
-        }
-
-        self.execute_search(repo_root, context, database, query, limit)
+        let _guard = lock_repo_operation(&repo_root).await;
+        self.search_repo_for_cli_from_root(repo_root, query, limit)
             .await
     }
 
@@ -108,13 +114,17 @@ impl AppServices {
         query: String,
         limit: usize,
     ) -> anyhow::Result<SearchRepoResponse> {
-        let (repo_root, context, database) = self.ensure_index_ready(path).await?;
+        let repo_root = canonicalize_repo_root(&path)?;
+        let _guard = lock_repo_operation(&repo_root).await;
+        let (repo_root, context, database) = self.ensure_index_ready_from_root(repo_root).await?;
         self.execute_search(repo_root, context, database, query, limit)
             .await
     }
 
     pub(crate) async fn repo_map_response(&self, path: PathBuf) -> anyhow::Result<RepoMap> {
-        let (repo_root, context, database) = self.ensure_index_ready(path).await?;
+        let repo_root = canonicalize_repo_root(&path)?;
+        let _guard = lock_repo_operation(&repo_root).await;
+        let (repo_root, context, database) = self.ensure_index_ready_from_root(repo_root).await?;
         RepoMapGenerator::generate(&repo_root, &database, &context.repo_id, &context.branch)
             .await
             .map_err(Into::into)
@@ -149,26 +159,100 @@ impl AppServices {
         })
     }
 
-    async fn ensure_index_ready(
+    async fn ensure_index_ready_from_root(
         &self,
-        path: PathBuf,
+        repo_root: PathBuf,
     ) -> anyhow::Result<(PathBuf, RepoContext, Database)> {
-        let repo_root = canonicalize_repo_root(&path)?;
-        let context = detect_repo_context(&repo_root)?;
-        let database = open_database(&repo_root).await?;
-        let metadata =
-            Storage::get_index_metadata(&database, &context.repo_id, &context.branch).await?;
+        for attempt in 0..=SEARCH_RETRY_ATTEMPTS {
+            wait_for_indexing_marker(&repo_root).await?;
 
-        let should_reindex = match metadata.as_ref() {
-            Some(metadata) => should_refresh_index(metadata, context.last_commit_sha.as_deref()),
-            None => !branch_has_index(&database, &context.repo_id, &context.branch).await?,
-        };
+            let context = detect_repo_context(&repo_root)?;
+            let database = open_database(&repo_root).await?;
+            let result = async {
+                let metadata =
+                    Storage::get_index_metadata(&database, &context.repo_id, &context.branch)
+                        .await?;
 
-        if should_reindex {
-            let _ = self.index_repo_response(repo_root.clone(), false).await?;
+                let should_reindex = match metadata.as_ref() {
+                    Some(metadata) => {
+                        should_refresh_index(metadata, context.last_commit_sha.as_deref())
+                    }
+                    None => !branch_has_index(&database, &context.repo_id, &context.branch).await?,
+                };
+
+                if should_reindex {
+                    let _ = self
+                        .index_repo_response_from_root(repo_root.clone(), false)
+                        .await?;
+                }
+
+                Ok::<_, anyhow::Error>((repo_root.clone(), context, database))
+            }
+            .await;
+
+            match result {
+                Ok(ready) => return Ok(ready),
+                Err(error)
+                    if should_retry_repo_operation(&error) && attempt < SEARCH_RETRY_ATTEMPTS =>
+                {
+                    tokio::time::sleep(StdDuration::from_millis(INDEXING_WAIT_INTERVAL_MS)).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
 
-        Ok((repo_root, context, database))
+        Err(anyhow!(
+            "timed out preparing index for {}",
+            repo_root.display()
+        ))
+    }
+
+    async fn search_repo_for_cli_from_root(
+        &self,
+        repo_root: PathBuf,
+        query: String,
+        limit: usize,
+    ) -> anyhow::Result<SearchRepoResponse> {
+        for attempt in 0..=SEARCH_RETRY_ATTEMPTS {
+            wait_for_indexing_marker(&repo_root).await?;
+
+            let context = detect_repo_context(&repo_root)?;
+            let database = open_database(&repo_root).await?;
+            let result = async {
+                let metadata =
+                    Storage::get_index_metadata(&database, &context.repo_id, &context.branch)
+                        .await?;
+
+                if metadata.is_none()
+                    && !branch_has_index(&database, &context.repo_id, &context.branch).await?
+                {
+                    return Err(anyhow!(
+                        "repository is not indexed for branch `{}`; run `truesight index {}` first",
+                        context.branch,
+                        repo_root.display()
+                    ));
+                }
+
+                self.execute_search(repo_root.clone(), context, database, query.clone(), limit)
+                    .await
+            }
+            .await;
+
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if should_retry_repo_operation(&error) && attempt < SEARCH_RETRY_ATTEMPTS =>
+                {
+                    tokio::time::sleep(StdDuration::from_millis(INDEXING_WAIT_INTERVAL_MS)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(anyhow!(
+            "timed out searching while index was being prepared for {}",
+            repo_root.display()
+        ))
     }
 }
 
@@ -215,8 +299,18 @@ async fn run_repomap(
 async fn open_database(repo_root: &Path) -> anyhow::Result<Database> {
     let db_path = Database::db_path_for_repo(repo_root)?;
     let database = Database::new(&db_path).await?;
-    database.run_migrations().await?;
-    Ok(database)
+
+    let mut attempts = 0_u8;
+    loop {
+        match database.run_migrations().await {
+            Ok(()) => return Ok(database),
+            Err(error) if error.to_string().contains("database is locked") && attempts < 20 => {
+                attempts += 1;
+                tokio::time::sleep(StdDuration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 async fn branch_has_index(
@@ -264,6 +358,107 @@ fn write_index_output(
     }
 
     Ok(())
+}
+
+async fn lock_repo_operation(repo_root: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+    let map = REPO_OPERATION_LOCKS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    let repo_lock = {
+        let mut locks = map.lock().await;
+        locks
+            .entry(repo_root.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+
+    repo_lock.lock_owned().await
+}
+
+struct IndexingMarker {
+    path: PathBuf,
+}
+
+impl Drop for IndexingMarker {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+async fn acquire_indexing_marker(repo_root: &Path) -> anyhow::Result<IndexingMarker> {
+    let marker_path = indexing_marker_path(repo_root)?;
+
+    for _ in 0..INDEXING_WAIT_RETRIES {
+        clear_stale_indexing_marker(
+            &marker_path,
+            StdDuration::from_secs(INDEXING_MARKER_STALE_SECS),
+        );
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)
+        {
+            Ok(_) => return Ok(IndexingMarker { path: marker_path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                tokio::time::sleep(StdDuration::from_millis(INDEXING_WAIT_INTERVAL_MS)).await;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to create index marker {}", marker_path.display())
+                });
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "timed out waiting for active index to finish for {}",
+        repo_root.display()
+    ))
+}
+
+async fn wait_for_indexing_marker(repo_root: &Path) -> anyhow::Result<()> {
+    let marker_path = indexing_marker_path(repo_root)?;
+
+    for _ in 0..INDEXING_WAIT_RETRIES {
+        clear_stale_indexing_marker(
+            &marker_path,
+            StdDuration::from_secs(INDEXING_MARKER_STALE_SECS),
+        );
+
+        if !marker_path.exists() {
+            return Ok(());
+        }
+
+        tokio::time::sleep(StdDuration::from_millis(INDEXING_WAIT_INTERVAL_MS)).await;
+    }
+
+    Err(anyhow!(
+        "timed out waiting for active index to finish for {}",
+        repo_root.display()
+    ))
+}
+
+fn indexing_marker_path(repo_root: &Path) -> anyhow::Result<PathBuf> {
+    let db_path = Database::db_path_for_repo(repo_root)?;
+    Ok(PathBuf::from(format!("{}.indexing", db_path.display())))
+}
+
+fn should_retry_repo_operation(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("database is locked")
+        || message.contains("no such table")
+        || message.contains("repository is not indexed for branch")
+}
+
+fn clear_stale_indexing_marker(marker_path: &Path, stale_after: StdDuration) {
+    let is_stale = fs::metadata(marker_path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed >= stale_after);
+
+    if is_stale {
+        let _ = fs::remove_file(marker_path);
+    }
 }
 
 fn write_search_output(
@@ -668,6 +863,24 @@ mod tests {
         assert!(should_refresh_index(&metadata, Some("new")));
         assert!(!should_refresh_index(&metadata, Some("old")));
         assert!(!should_refresh_index(&metadata, None));
+    }
+
+    #[test]
+    fn stale_indexing_marker_is_removed() {
+        let fixture = TempGitFixture::new("rust-fixture");
+        let marker_path = indexing_marker_path(fixture.path()).expect("marker path should resolve");
+        if let Some(parent) = marker_path.parent() {
+            fs::create_dir_all(parent).expect("marker parent should exist");
+        }
+
+        fs::write(&marker_path, b"busy").expect("marker file should be created");
+        clear_stale_indexing_marker(&marker_path, StdDuration::ZERO);
+
+        assert!(
+            !marker_path.exists(),
+            "stale marker should be removed: {}",
+            marker_path.display()
+        );
     }
 
     #[tokio::test]

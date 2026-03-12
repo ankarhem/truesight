@@ -298,6 +298,164 @@ impl Database {
         Ok(())
     }
 
+    pub async fn replace_branch_index(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        units: &[IndexedCodeUnit],
+        indexed_files: &[IndexedFileRecord],
+        metadata: &IndexMetadata,
+    ) -> Result<()> {
+        let connection = self.connect().await.map_err(TruesightError::from)?;
+        let transaction = connection
+            .transaction()
+            .await
+            .map_err(DatabaseError::from)?;
+
+        transaction
+            .execute(
+                "DELETE FROM code_units WHERE repo_id = ?1 AND branch = ?2",
+                params![repo_id, branch],
+            )
+            .await
+            .map_err(DatabaseError::from)?;
+        transaction
+            .execute(
+                "DELETE FROM indexed_files WHERE repo_id = ?1 AND branch = ?2",
+                params![repo_id, branch],
+            )
+            .await
+            .map_err(DatabaseError::from)?;
+        transaction
+            .execute(
+                "DELETE FROM index_metadata WHERE repo_id = ?1 AND branch = ?2",
+                params![repo_id, branch],
+            )
+            .await
+            .map_err(DatabaseError::from)?;
+
+        for entry in units {
+            let unit_id = code_unit_id(repo_id, branch, &entry.unit);
+            let embedding_blob = entry
+                .embedding
+                .as_deref()
+                .map(encode_embedding)
+                .transpose()
+                .map_err(TruesightError::from)?;
+            let file_hash = entry
+                .file_hash
+                .clone()
+                .unwrap_or_else(|| default_file_hash(&entry.unit));
+
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO code_units (
+                        id,
+                        repo_id,
+                        branch,
+                        file_path,
+                        name,
+                        kind,
+                        signature,
+                        doc,
+                        content,
+                        parent,
+                        language,
+                        line_start,
+                        line_end,
+                        embedding,
+                        file_hash
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                    ON CONFLICT(repo_id, branch, file_path, name, kind, line_start) DO UPDATE SET
+                        id = excluded.id,
+                        signature = excluded.signature,
+                        doc = excluded.doc,
+                        content = excluded.content,
+                        parent = excluded.parent,
+                        language = excluded.language,
+                        line_end = excluded.line_end,
+                        embedding = excluded.embedding,
+                        file_hash = excluded.file_hash
+                    "#,
+                    params![
+                        unit_id,
+                        repo_id,
+                        branch,
+                        path_to_string(&entry.unit.file_path),
+                        entry.unit.name.clone(),
+                        code_unit_kind_to_str(entry.unit.kind),
+                        entry.unit.signature.clone(),
+                        entry.unit.doc.clone(),
+                        entry.unit.content.clone(),
+                        entry.unit.parent.clone(),
+                        language_to_str(entry.unit.language),
+                        i64::from(entry.unit.line_start),
+                        i64::from(entry.unit.line_end),
+                        embedding_blob,
+                        file_hash,
+                    ],
+                )
+                .await
+                .map_err(DatabaseError::from)?;
+        }
+
+        for file in indexed_files {
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO indexed_files (repo_id, branch, file_path, file_hash)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(repo_id, branch, file_path) DO UPDATE SET
+                        file_hash = excluded.file_hash,
+                        indexed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    "#,
+                    params![
+                        repo_id,
+                        branch,
+                        path_to_string(&file.file_path),
+                        file.file_hash.clone()
+                    ],
+                )
+                .await
+                .map_err(DatabaseError::from)?;
+        }
+
+        transaction
+            .execute(
+                r#"
+                INSERT INTO index_metadata (
+                    repo_id,
+                    branch,
+                    last_indexed_at,
+                    last_commit_sha,
+                    file_count,
+                    symbol_count
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(repo_id, branch) DO UPDATE SET
+                    last_indexed_at = excluded.last_indexed_at,
+                    last_commit_sha = excluded.last_commit_sha,
+                    file_count = excluded.file_count,
+                    symbol_count = excluded.symbol_count
+                "#,
+                params![
+                    repo_id,
+                    branch,
+                    metadata.last_indexed_at.to_rfc3339(),
+                    metadata.last_commit_sha.clone(),
+                    i64::from(metadata.file_count),
+                    i64::from(metadata.symbol_count),
+                ],
+            )
+            .await
+            .map_err(DatabaseError::from)?;
+
+        transaction.commit().await.map_err(DatabaseError::from)?;
+        Ok(())
+    }
+
     pub async fn get_indexed_files(
         &self,
         repo_id: &str,
@@ -740,6 +898,17 @@ impl IndexStorage for Database {
     ) -> Result<()> {
         Database::upsert_indexed_file(self, repo_id, branch, file_path, file_hash).await
     }
+
+    async fn replace_branch_index(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        units: &[IndexedCodeUnit],
+        indexed_files: &[IndexedFileRecord],
+        metadata: &IndexMetadata,
+    ) -> Result<()> {
+        Database::replace_branch_index(self, repo_id, branch, units, indexed_files, metadata).await
+    }
 }
 
 #[async_trait]
@@ -798,7 +967,7 @@ async fn run_incremental_migrations(
         transaction.execute_batch(sql).await?;
         transaction
             .execute(
-                "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?1, ?2)",
                 params![version, name],
             )
             .await?;
