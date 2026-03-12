@@ -54,6 +54,8 @@ fn mcp_initialize_and_list_tools_reports_exact_contract() {
             tool.get("outputSchema").is_some(),
             "tool should publish outputSchema"
         );
+        assert_no_unsupported_integer_formats(&tool["inputSchema"]);
+        assert_no_unsupported_integer_formats(&tool["outputSchema"]);
     }
 }
 
@@ -277,5 +279,28 @@ fn rust_fixture_repo() -> PathBuf {
 fn cleanup_repo_database(repo_root: &Path) {
     if let Ok(db_path) = Database::db_path_for_repo(repo_root) {
         let _ = fs::remove_file(db_path);
+    }
+}
+
+fn assert_no_unsupported_integer_formats(value: &Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(format) = map.get("format").and_then(Value::as_str) {
+                assert!(
+                    format != "uint32" && format != "uint",
+                    "schema should not contain unsupported integer format `{format}`: {value}"
+                );
+            }
+
+            for nested in map.values() {
+                assert_no_unsupported_integer_formats(nested);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_no_unsupported_integer_formats(item);
+            }
+        }
+        _ => {}
     }
 }

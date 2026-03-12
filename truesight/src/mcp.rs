@@ -8,7 +8,7 @@ use rmcp::{
     Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    schemars::JsonSchema,
+    schemars::{JsonSchema, Schema, SchemaGenerator, json_schema},
     tool, tool_handler, tool_router,
     transport::io::stdio,
 };
@@ -140,6 +140,7 @@ struct SearchRepoRequest {
     #[schemars(description = "Path to the repository root")]
     path: String,
     #[schemars(description = "Maximum number of results to return")]
+    #[schemars(schema_with = "non_negative_integer_schema")]
     limit: Option<usize>,
 }
 
@@ -196,6 +197,7 @@ struct SymbolInfoResponse {
     signature: String,
     doc: Option<String>,
     file: String,
+    #[schemars(schema_with = "non_negative_integer_schema")]
     line: u32,
 }
 
@@ -216,6 +218,7 @@ impl From<truesight_core::SymbolInfo> for SymbolInfoResponse {
 struct SearchRepoToolResponse {
     query: String,
     results: Vec<SearchResultResponse>,
+    #[schemars(schema_with = "non_negative_integer_schema")]
     total_results: usize,
     search_mode: String,
 }
@@ -236,6 +239,7 @@ struct SearchResultResponse {
     kind: String,
     name: String,
     path: PathBuf,
+    #[schemars(schema_with = "non_negative_integer_schema")]
     line: u32,
     signature: String,
     doc: Option<String>,
@@ -266,6 +270,7 @@ struct IndexRepoToolResponse {
     repo_root: PathBuf,
     branch: String,
     stats: IndexRepoStatsResponse,
+    #[schemars(schema_with = "string_to_non_negative_integer_map_schema")]
     languages: HashMap<String, u32>,
 }
 
@@ -283,11 +288,17 @@ impl From<IndexRepoResponse> for IndexRepoToolResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct IndexRepoStatsResponse {
+    #[schemars(schema_with = "non_negative_integer_schema")]
     files_scanned: u32,
+    #[schemars(schema_with = "non_negative_integer_schema")]
     files_indexed: u32,
+    #[schemars(schema_with = "non_negative_integer_schema")]
     files_skipped: u32,
+    #[schemars(schema_with = "non_negative_integer_schema")]
     symbols_extracted: u32,
+    #[schemars(schema_with = "non_negative_integer_schema")]
     chunks_embedded: u32,
+    #[schemars(schema_with = "non_negative_integer_schema")]
     duration_ms: u64,
 }
 
@@ -337,6 +348,23 @@ fn match_type_label(match_type: MatchType) -> &'static str {
         MatchType::Vector => "vector",
         MatchType::Hybrid => "hybrid",
     }
+}
+
+fn non_negative_integer_schema(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "type": "integer",
+        "minimum": 0,
+    })
+}
+
+fn string_to_non_negative_integer_map_schema(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "type": "object",
+        "additionalProperties": {
+            "type": "integer",
+            "minimum": 0,
+        },
+    })
 }
 
 #[cfg(test)]
