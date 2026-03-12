@@ -27,7 +27,7 @@ trait TruesightApp: Send + Sync {
         query: String,
         limit: usize,
     ) -> AppFuture<SearchRepoResponse>;
-    fn repo_map(&self, path: PathBuf) -> AppFuture<RepoMap>;
+    fn repo_map(&self, path: PathBuf, filter: Option<String>) -> AppFuture<RepoMap>;
 }
 
 impl TruesightApp for AppServices {
@@ -46,9 +46,9 @@ impl TruesightApp for AppServices {
         Box::pin(async move { this.search_repo_response(path, query, limit).await })
     }
 
-    fn repo_map(&self, path: PathBuf) -> AppFuture<RepoMap> {
+    fn repo_map(&self, path: PathBuf, filter: Option<String>) -> AppFuture<RepoMap> {
         let this = self.clone();
-        Box::pin(async move { this.repo_map_response(path).await })
+        Box::pin(async move { this.repo_map_response(path, filter).await })
     }
 }
 
@@ -86,15 +86,15 @@ impl TruesightMcp {
 #[tool_router]
 impl TruesightMcp {
     #[tool(
-        description = "Get a structured repository map with modules, files, symbols, and dependency hints"
+        description = "Get a structured repository map after search narrows the area; best for module boundaries, key symbols, dependency hints, and optionally focusing on a repo-relative path prefix"
     )]
     async fn repo_map(
         &self,
-        Parameters(RepoMapRequest { path }): Parameters<RepoMapRequest>,
+        Parameters(RepoMapRequest { path, filter }): Parameters<RepoMapRequest>,
     ) -> Result<Json<RepoMapToolResponse>, String> {
         let repo_map = self
             .app
-            .repo_map(PathBuf::from(path))
+            .repo_map(PathBuf::from(path), filter)
             .await
             .map_err(|error| error.to_string())?;
         Ok(Json(repo_map.into()))
@@ -135,6 +135,10 @@ impl TruesightMcp {
 struct RepoMapRequest {
     #[schemars(description = "Path to the repository root")]
     path: String,
+    #[schemars(
+        description = "Optional repo-relative path prefix to limit the map to a directory or file"
+    )]
+    filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -323,7 +327,7 @@ impl From<IndexRepoStats> for IndexRepoStatsResponse {
 impl ServerHandler for TruesightMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Truesight exposes exactly three tools: search_repo, repo_map, and index_repo. Use search_repo first when you do not know where something lives and want ranked semantic plus lexical code search; pair it with grep when you need exact string or regex confirmation. Use repo_map after search when you need module boundaries, key symbols, and dependency context. Use index_repo only to refresh or repair search data when results are missing, stale, or after major repository changes.",
+            "Truesight exposes exactly three tools: search_repo, repo_map, and index_repo. Use search_repo first when you do not know where something lives and want ranked semantic plus lexical code search; pair it with grep when you need exact string or regex confirmation. Use repo_map after search when you need module boundaries, key symbols, and dependency context, and pass a filter when you want to focus on a specific repo-relative directory or file. Use index_repo only to refresh or repair search data when results are missing, stale, or after major repository changes.",
         )
     }
 }
@@ -439,6 +443,7 @@ mod tests {
         fn repo_map(
             &self,
             path: PathBuf,
+            _filter: Option<String>,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<RepoMap>> + Send + 'static>> {
             Box::pin(async move {
                 Ok(RepoMap {
@@ -508,6 +513,7 @@ mod tests {
         let repo_map_result = server
             .repo_map(Parameters(RepoMapRequest {
                 path: String::from("/repo"),
+                filter: Some(String::from("src")),
             }))
             .await
             .unwrap()

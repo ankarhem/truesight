@@ -121,13 +121,23 @@ impl AppServices {
             .await
     }
 
-    pub(crate) async fn repo_map_response(&self, path: PathBuf) -> anyhow::Result<RepoMap> {
+    pub(crate) async fn repo_map_response(
+        &self,
+        path: PathBuf,
+        filter: Option<String>,
+    ) -> anyhow::Result<RepoMap> {
         let repo_root = canonicalize_repo_root(&path)?;
         let _guard = lock_repo_operation(&repo_root).await;
         let (repo_root, context, database) = self.ensure_index_ready_from_root(repo_root).await?;
-        RepoMapGenerator::generate(&repo_root, &database, &context.repo_id, &context.branch)
-            .await
-            .map_err(Into::into)
+        RepoMapGenerator::generate(
+            &repo_root,
+            &database,
+            &context.repo_id,
+            &context.branch,
+            filter.as_deref(),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn execute_search(
@@ -292,7 +302,7 @@ async fn run_repomap(
     args: RepoMapArgs,
     writer: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let response = app.repo_map_response(args.path).await?;
+    let response = app.repo_map_response(args.path, args.filter).await?;
     write_repomap_output(writer, &response)
 }
 
@@ -922,6 +932,7 @@ mod tests {
             Cli {
                 command: Commands::RepoMap(RepoMapArgs {
                     path: fixture.path_buf(),
+                    filter: None,
                 }),
             },
             &mut output,

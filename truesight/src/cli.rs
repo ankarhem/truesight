@@ -37,6 +37,8 @@ pub struct SearchArgs {
 pub struct RepoMapArgs {
     #[arg(default_value = ".")]
     pub path: PathBuf,
+    #[arg(long)]
+    pub filter: Option<String>,
 }
 
 #[cfg(test)]
@@ -87,6 +89,29 @@ mod tests {
                 assert_eq!(args.limit, 5);
             }
             command => panic!("expected search command, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn repomap_subcommand_parses_optional_filter() {
+        let cli = Cli::try_parse_from([
+            "truesight",
+            "repo-map",
+            "tests/fixtures/rust-fixture",
+            "--filter",
+            "src",
+        ])
+        .expect("repo-map arguments should parse");
+
+        match cli.command {
+            super::Commands::RepoMap(args) => {
+                assert_eq!(
+                    args.path,
+                    std::path::PathBuf::from("tests/fixtures/rust-fixture")
+                );
+                assert_eq!(args.filter.as_deref(), Some("src"));
+            }
+            command => panic!("expected repo-map command, got {command:?}"),
         }
     }
 }

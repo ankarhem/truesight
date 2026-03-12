@@ -10,7 +10,7 @@ pub struct RepoMapGenerator;
 impl RepoMapGenerator {
     pub async fn generate_for_repo(root: &Path, storage: &dyn Storage) -> Result<RepoMap> {
         let context = detect_repo_context(root)?;
-        Self::generate(root, storage, &context.repo_id, &context.branch).await
+        Self::generate(root, storage, &context.repo_id, &context.branch, None).await
     }
 
     pub async fn generate(
@@ -18,8 +18,15 @@ impl RepoMapGenerator {
         storage: &dyn Storage,
         repo_id: &str,
         branch: &str,
+        filter: Option<&str>,
     ) -> Result<RepoMap> {
-        let units = storage.get_all_symbols(repo_id, branch).await?;
+        let filter = normalized_filter(filter);
+        let units = storage
+            .get_all_symbols(repo_id, branch)
+            .await?
+            .into_iter()
+            .filter(|unit| matches_filter(root, &unit.file_path, filter.as_deref()))
+            .collect::<Vec<_>>();
         let repo_root = root.to_path_buf();
 
         if units.is_empty() {
@@ -78,6 +85,25 @@ impl RepoMapGenerator {
                 .collect(),
         })
     }
+}
+
+fn normalized_filter(filter: Option<&str>) -> Option<String> {
+    filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_matches('/').replace('\\', "/"))
+        .filter(|value| !value.is_empty() && value != ".")
+}
+
+fn matches_filter(root: &Path, file_path: &Path, filter: Option<&str>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+
+    let relative = relative_path(root, file_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    relative == filter || relative.starts_with(&format!("{filter}/"))
 }
 
 #[derive(Debug)]
@@ -260,7 +286,7 @@ mod tests {
         let root = fixture_root("rust-fixture");
         let storage = StaticStorage::new(rust_fixture_units(&root));
 
-        let repo_map = RepoMapGenerator::generate(&root, &storage, REPO_ID, BRANCH)
+        let repo_map = RepoMapGenerator::generate(&root, &storage, REPO_ID, BRANCH, None)
             .await
             .expect("repo map should generate");
 
@@ -345,7 +371,7 @@ mod tests {
             ),
         ]);
 
-        let repo_map = RepoMapGenerator::generate(&root, &storage, REPO_ID, BRANCH)
+        let repo_map = RepoMapGenerator::generate(&root, &storage, REPO_ID, BRANCH, None)
             .await
             .expect("repo map should generate");
 
@@ -370,7 +396,7 @@ mod tests {
         let root = PathBuf::from("/empty-repo");
         let storage = StaticStorage::new(Vec::new());
 
-        let repo_map = RepoMapGenerator::generate(&root, &storage, REPO_ID, BRANCH)
+        let repo_map = RepoMapGenerator::generate(&root, &storage, REPO_ID, BRANCH, None)
             .await
             .expect("repo map should generate");
 
@@ -402,7 +428,7 @@ mod tests {
             ),
         ]);
 
-        let repo_map = RepoMapGenerator::generate(&root, &storage, REPO_ID, BRANCH)
+        let repo_map = RepoMapGenerator::generate(&root, &storage, REPO_ID, BRANCH, None)
             .await
             .expect("repo map should generate");
 
@@ -412,6 +438,23 @@ mod tests {
             .find(|module| module.path == Path::new("services"))
             .expect("services module should exist");
         assert_eq!(services.depends_on, vec![String::from("shared")]);
+    }
+
+    #[tokio::test]
+    async fn test_repromap_filters_to_matching_path_prefix() {
+        let root = fixture_root("rust-fixture");
+        let storage = StaticStorage::new(rust_fixture_units(&root));
+
+        let repo_map =
+            RepoMapGenerator::generate(&root, &storage, REPO_ID, BRANCH, Some("src/lib.rs"))
+                .await
+                .expect("filtered repo map should generate");
+
+        assert_eq!(repo_map.modules.len(), 1);
+        let module = &repo_map.modules[0];
+        assert_eq!(module.path, PathBuf::from("src"));
+        assert_eq!(module.files, vec!["lib.rs"]);
+        assert!(module.symbols.iter().all(|symbol| symbol.file == "lib.rs"));
     }
 
     fn rust_fixture_units(root: &Path) -> Vec<CodeUnit> {

@@ -119,6 +119,7 @@ fn mcp_index_and_repo_map_tool_calls_work_over_real_stdio_transport() {
             "name": "repo_map",
             "arguments": {
                 "path": fixture.display().to_string(),
+                "filter": "src/lib.rs",
             }
         }),
     );
@@ -143,7 +144,7 @@ fn mcp_index_and_repo_map_tool_calls_work_over_real_stdio_transport() {
     assert_eq!(modules.len(), 1);
     assert_eq!(modules[0]["name"], "src");
     assert_eq!(modules[0]["path"], "src");
-    assert_eq!(modules[0]["files"], json!(["lib.rs", "utils.rs"]));
+    assert_eq!(modules[0]["files"], json!(["lib.rs"]));
 
     let symbol_names = modules[0]["symbols"]
         .as_array()
@@ -156,12 +157,12 @@ fn mcp_index_and_repo_map_tool_calls_work_over_real_stdio_transport() {
                 .to_string()
         })
         .collect::<Vec<_>>();
-    assert_eq!(symbol_names.len(), 12);
+    assert_eq!(symbol_names.len(), 9);
     assert!(symbol_names.contains(&String::from("User")));
     assert!(symbol_names.contains(&String::from("ValidationError")));
     assert!(symbol_names.contains(&String::from("Validatable")));
     assert!(symbol_names.contains(&String::from("calculate_checksum")));
-    assert!(symbol_names.contains(&String::from("format_name")));
+    assert!(!symbol_names.contains(&String::from("format_name")));
 
     let user_symbol = modules[0]["symbols"]
         .as_array()
