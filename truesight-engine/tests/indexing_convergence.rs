@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use tempfile::TempDir;
 use truesight_core::{
     CodeUnit, Embedder, IncrementalStorage, IndexMetadata, IndexStats, IndexStorage,
     IndexedCodeUnit, IndexedFileRecord, RankedResult, Storage,
@@ -12,7 +13,7 @@ use truesight_engine::{IncrementalIndexer, detect_repo_context, index_repo};
 #[path = "test_support/git_fixture.rs"]
 mod git_fixture;
 
-use git_fixture::TempGitFixture;
+use git_fixture::{TempGitFixture, init_git_repo};
 
 #[derive(Clone, Default)]
 struct RecordingStorage {
@@ -246,7 +247,55 @@ struct ComparableMetadata {
 #[tokio::test]
 async fn full_and_incremental_indexing_store_equivalent_results_for_same_repo_state() {
     let fixture = TempGitFixture::new("rust-fixture");
-    let root = fixture.path();
+    let (full_stats, full_storage, incremental_stats, incremental_storage) =
+        index_with_full_and_incremental(fixture.path()).await;
+
+    assert_eq!(
+        comparable_stats(&full_stats),
+        comparable_stats(&incremental_stats)
+    );
+    assert_eq!(
+        stored_units(&full_storage),
+        stored_units(&incremental_storage)
+    );
+    assert_eq!(
+        indexed_files(&full_storage),
+        indexed_files(&incremental_storage)
+    );
+    assert_eq!(metadata(&full_storage), metadata(&incremental_storage));
+}
+
+#[tokio::test]
+async fn full_and_incremental_indexing_agree_on_private_only_supported_files() {
+    let temp = TempDir::new().expect("temp dir should exist");
+    let repo_root = temp.path().join("repo");
+    write_file(
+        &repo_root,
+        "src/internal.rs",
+        "fn hidden_example() -> bool { true }\n",
+    );
+    init_git_repo(&repo_root, "initial private file");
+
+    let (full_stats, full_storage, incremental_stats, incremental_storage) =
+        index_with_full_and_incremental(&repo_root).await;
+
+    assert_eq!(
+        comparable_stats(&full_stats),
+        comparable_stats(&incremental_stats)
+    );
+    assert!(stored_units(&full_storage).is_empty());
+    assert!(stored_units(&incremental_storage).is_empty());
+    assert_eq!(indexed_files(&full_storage).len(), 1);
+    assert_eq!(indexed_files(&incremental_storage).len(), 1);
+    assert_eq!(metadata(&full_storage).file_count, 1);
+    assert_eq!(metadata(&incremental_storage).file_count, 1);
+    assert_eq!(metadata(&full_storage).symbol_count, 0);
+    assert_eq!(metadata(&incremental_storage).symbol_count, 0);
+}
+
+async fn index_with_full_and_incremental(
+    root: &Path,
+) -> (IndexStats, RecordingStorage, IndexStats, RecordingStorage) {
     let context = detect_repo_context(root).expect("repo context should resolve");
     let full_storage = RecordingStorage::default();
     let incremental_storage = RecordingStorage::default();
@@ -278,19 +327,12 @@ async fn full_and_incremental_indexing_store_equivalent_results_for_same_repo_st
         .await
         .expect("incremental indexing should succeed");
 
-    assert_eq!(
-        comparable_stats(&full_stats),
-        comparable_stats(&incremental_stats)
-    );
-    assert_eq!(
-        stored_units(&full_storage),
-        stored_units(&incremental_storage)
-    );
-    assert_eq!(
-        indexed_files(&full_storage),
-        indexed_files(&incremental_storage)
-    );
-    assert_eq!(metadata(&full_storage), metadata(&incremental_storage));
+    (
+        full_stats,
+        full_storage,
+        incremental_stats,
+        incremental_storage,
+    )
 }
 
 fn comparable_stats(stats: &IndexStats) -> (u32, u32, u32, u32, u32, Vec<(String, u32)>) {
@@ -373,4 +415,12 @@ fn metadata(storage: &RecordingStorage) -> ComparableMetadata {
         file_count: metadata.file_count,
         symbol_count: metadata.symbol_count,
     }
+}
+
+fn write_file(root: &Path, relative: &str, contents: &str) {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("parent dir should exist");
+    }
+    std::fs::write(path, contents).expect("fixture file should write");
 }
