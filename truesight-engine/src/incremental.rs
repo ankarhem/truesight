@@ -294,36 +294,52 @@ fn current_commit_sha(root: &Path) -> Result<String> {
 }
 
 fn git_changes(root: &Path, last_sha: &str) -> Result<ChangeSet> {
-    let output = git_command(
-        root,
-        ["diff", "--name-status", "--no-renames", last_sha, "HEAD"],
-    )?;
-    let mut changes = ChangeSet::default();
-
-    for line in output.lines().filter(|line| !line.trim().is_empty()) {
-        let mut parts = line.split_whitespace();
-        let status = parts.next().unwrap_or_default();
-        let path = parts.next().ok_or_else(|| {
-            TruesightError::Git(format!("missing path in git diff output line: {line}"))
-        })?;
-        let path = PathBuf::from(path);
-        if Language::from_path(&path).is_none() {
-            continue;
-        }
-
-        match status.chars().next().unwrap_or_default() {
-            'A' => changes.added.push(path),
-            'M' => changes.modified.push(path),
-            'D' => changes.deleted.push(path),
-            _ => {}
-        }
-    }
+    let mut changes = ChangeSet {
+        added: git_diff_paths(root, last_sha, "A")?,
+        modified: git_diff_paths(root, last_sha, "M")?,
+        deleted: git_diff_paths(root, last_sha, "D")?,
+    };
 
     changes.normalize();
     Ok(changes)
 }
 
-fn git_command<const N: usize>(root: &Path, args: [&str; N]) -> Result<String> {
+fn git_diff_paths(root: &Path, last_sha: &str, diff_filter: &str) -> Result<Vec<PathBuf>> {
+    let diff_filter_arg = format!("--diff-filter={diff_filter}");
+    let output = git_command_bytes(
+        root,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            diff_filter_arg.as_str(),
+            "-z",
+            last_sha,
+            "HEAD",
+        ],
+    )?;
+
+    output
+        .split(|byte| *byte == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .filter_map(|chunk| {
+            let path = match std::str::from_utf8(chunk) {
+                Ok(path) => PathBuf::from(path),
+                Err(error) => {
+                    return Some(Err(TruesightError::Git(error.to_string())));
+                }
+            };
+
+            if Language::from_path(&path).is_none() {
+                return None;
+            }
+
+            Some(Ok(path))
+        })
+        .collect()
+}
+
+fn git_command_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .args(args)
         .current_dir(root)
@@ -338,7 +354,13 @@ fn git_command<const N: usize>(root: &Path, args: [&str; N]) -> Result<String> {
         }));
     }
 
-    String::from_utf8(output.stdout)
+    Ok(output.stdout)
+}
+
+fn git_command<const N: usize>(root: &Path, args: [&str; N]) -> Result<String> {
+    let output = git_command_bytes(root, &args)?;
+
+    String::from_utf8(output)
         .map(|stdout| stdout.trim().to_string())
         .map_err(|error| TruesightError::Git(error.to_string()))
 }
@@ -643,6 +665,67 @@ mod tests {
             .expect("git detection should succeed");
 
         assert_eq!(change_paths(&changes.modified), set_of(["src/lib.rs"]));
+        assert!(changes.added.is_empty());
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_detection_handles_paths_with_spaces_and_unicode() {
+        let temp = git_repo();
+        write_file(
+            temp.path(),
+            "src/naïve file.rs",
+            "pub fn alpha() -> bool { true }\n",
+        );
+        write_file(
+            temp.path(),
+            "src/plain.rs",
+            "pub fn beta() -> bool { false }\n",
+        );
+        git_commit_all(temp.path(), "initial");
+
+        let database = TestStorage::default();
+        let indexer = IncrementalIndexer::new();
+        let embedder = FakeEmbedder;
+        let context = detect_repo_context(temp.path()).expect("repo context should resolve");
+
+        let initial_changes = indexer
+            .detect_changes(temp.path(), &database, &context.repo_id, &context.branch)
+            .await
+            .unwrap();
+        indexer
+            .incremental_index(
+                temp.path(),
+                &initial_changes,
+                &database,
+                &embedder,
+                &context.repo_id,
+                &context.branch,
+            )
+            .await
+            .unwrap();
+
+        write_file(
+            temp.path(),
+            "src/naïve file.rs",
+            "pub fn alpha_v2() -> bool { false }\n",
+        );
+        write_file(
+            temp.path(),
+            "src/plain.rs",
+            "pub fn beta_v2() -> bool { true }\n",
+        );
+        git_commit_all(temp.path(), "modify unicode and spaced paths");
+
+        let changes = indexer
+            .detect_changes(temp.path(), &database, &context.repo_id, &context.branch)
+            .await
+            .expect("git detection should handle unicode and spaced paths");
+
+        assert_eq!(
+            change_paths(&changes.modified),
+            set_of(["src/naïve file.rs", "src/plain.rs"])
+        );
         assert!(changes.added.is_empty());
         assert!(changes.deleted.is_empty());
     }
