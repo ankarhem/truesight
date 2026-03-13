@@ -816,6 +816,10 @@ mod tests {
         )
         .await
         .expect("empty query should not crash");
+
+        let text = String::from_utf8(output).expect("search output should be utf-8");
+        assert!(text.contains("query: "));
+        assert!(text.contains("total_results:"));
     }
 
     #[test]

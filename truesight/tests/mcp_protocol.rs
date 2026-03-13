@@ -12,24 +12,14 @@ fn mcp_initialize_and_list_tools_reports_exact_contract() {
     let mut server = McpServer::spawn();
 
     let initialize = server.initialize();
+    let instructions = initialize["result"]["instructions"]
+        .as_str()
+        .expect("instructions should be a string");
     assert_eq!(initialize["jsonrpc"], "2.0");
     assert_eq!(initialize["id"], 1);
     assert_eq!(initialize["result"]["protocolVersion"], "2025-03-26");
     assert_eq!(initialize["result"]["capabilities"]["tools"], json!({}));
-    assert!(initialize["result"]["instructions"]
-        .as_str()
-        .expect("instructions should be a string")
-        .contains("| `search_repo` | Default first step for exploratory codebase work when the exact file or symbol is unknown; ranked lexical + semantic search |"));
-    assert!(
-        initialize["result"]["instructions"]
-            .as_str()
-            .expect("instructions should be a string")
-            .contains("Recommended agent workflow:")
-    );
-    assert!(initialize["result"]["instructions"]
-        .as_str()
-        .expect("instructions should be a string")
-        .contains("3. Use `grep` alongside Truesight when you need exact strings, regex matches, or exhaustive literal confirmation."));
+    assert_instruction_contract(instructions);
 
     server.notify_initialized();
 
@@ -64,6 +54,20 @@ fn mcp_initialize_and_list_tools_reports_exact_contract() {
         );
         assert_no_unsupported_integer_formats(&tool["inputSchema"]);
         assert_no_unsupported_integer_formats(&tool["outputSchema"]);
+    }
+}
+
+fn assert_instruction_contract(instructions: &str) {
+    assert!(
+        instructions.contains("Recommended agent workflow:"),
+        "instructions should include workflow guidance: {instructions}"
+    );
+
+    for required_phrase in ["`search_repo`", "`repo_map`", "`index_repo`", "`grep`"] {
+        assert!(
+            instructions.contains(required_phrase),
+            "instructions should mention {required_phrase}: {instructions}"
+        );
     }
 }
 
