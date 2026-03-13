@@ -5,10 +5,10 @@ use std::process::Command;
 use std::time::Instant;
 
 use truesight_core::{
-    Embedder, IncrementalStorage, IndexMetadata, IndexStats, IndexedCodeUnit, Language, Result,
-    TruesightError,
+    Embedder, IncrementalStorage, IndexMetadata, IndexStats, Language, Result, TruesightError,
 };
 
+use crate::indexing::{build_indexed_units, repo_relative_path};
 use crate::parser::parse_file;
 use crate::repo_context::{RepoContext, detect_repo_context};
 use crate::util::hash_bytes;
@@ -201,7 +201,7 @@ impl IncrementalIndexer {
                 .walker
                 .walk(root)?
                 .into_iter()
-                .map(|file| relativize(root, &file.path))
+                .map(|file| repo_relative_path(root, &file.path))
                 .collect::<Result<Vec<_>>>()?,
             modified: Vec::new(),
             deleted: Vec::new(),
@@ -225,7 +225,7 @@ impl IncrementalIndexer {
         let mut current_hashes = HashMap::new();
 
         for discovered in self.walker.walk(root)? {
-            let relative_path = relativize(root, &discovered.path)?;
+            let relative_path = repo_relative_path(root, &discovered.path)?;
             let file_hash = hash_file(&discovered.path)?;
             current_hashes.insert(relative_path, file_hash);
         }
@@ -269,16 +269,7 @@ impl IncrementalIndexer {
         let source = fs::read(&absolute_path)?;
         let file_hash = hash_bytes(&source);
         let units = parse_file(relative_path, &source, language)?;
-        let mut stored_units = Vec::with_capacity(units.len());
-
-        for unit in units {
-            let embedding = ctx.embedder.embed(&unit.content)?;
-            stored_units.push(IndexedCodeUnit {
-                unit,
-                embedding: Some(embedding),
-                file_hash: Some(file_hash.clone()),
-            });
-        }
+        let stored_units = build_indexed_units(units, &file_hash, ctx.embedder)?;
 
         ctx.storage
             .store_indexed_units(ctx.repo_id, ctx.branch, &stored_units)
@@ -350,18 +341,6 @@ fn git_command<const N: usize>(root: &Path, args: [&str; N]) -> Result<String> {
     String::from_utf8(output.stdout)
         .map(|stdout| stdout.trim().to_string())
         .map_err(|error| TruesightError::Git(error.to_string()))
-}
-
-fn relativize(root: &Path, path: &Path) -> Result<PathBuf> {
-    path.strip_prefix(root)
-        .map(|relative| relative.to_path_buf())
-        .map_err(|_| {
-            TruesightError::Index(format!(
-                "{} is outside repository root {}",
-                path.display(),
-                root.display()
-            ))
-        })
 }
 
 fn hash_file(path: &Path) -> Result<String> {

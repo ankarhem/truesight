@@ -1,6 +1,7 @@
 pub mod embed;
 pub mod incremental;
 pub mod indexer;
+pub(crate) mod indexing;
 pub mod parser;
 pub mod repo_context;
 pub mod repomap;

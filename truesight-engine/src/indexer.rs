@@ -11,6 +11,7 @@ use truesight_core::{
     IndexedFileRecord, Language, Result,
 };
 
+use crate::indexing::{build_indexed_units, repo_relative_path};
 use crate::parser::CodeParser;
 use crate::repo_context::detect_repo_context;
 use crate::util::hash_bytes;
@@ -78,11 +79,13 @@ where
         let processed = discovered
             .par_iter()
             .enumerate()
-            .filter_map(|(index, file)| match process_file(index + 1, discovered.len(), file, &self.parser, embedder) {
-                Ok(outcome) => Some(outcome),
-                Err(error) => {
-                    warn!(path = %file.path.display(), error = %error, "skipping file during indexing");
-                    None
+            .filter_map(|(index, file)| {
+                match process_file(index + 1, discovered.len(), root, file, &self.parser, embedder) {
+                    Ok(outcome) => Some(outcome),
+                    Err(error) => {
+                        warn!(path = %file.path.display(), error = %error, "skipping file during indexing");
+                        None
+                    }
                 }
             })
             .collect::<Vec<_>>();
@@ -157,6 +160,7 @@ where
 fn process_file<P, E>(
     index: usize,
     total: usize,
+    root: &Path,
     file: &DiscoveredFile,
     parser: &P,
     embedder: &E,
@@ -169,42 +173,26 @@ where
 
     let source = fs::read(&file.path)?;
     let file_hash = hash_bytes(&source);
-    let parsed_units = parser.parse_file(&file.path, &source, file.language)?;
+    let relative_path = repo_relative_path(root, &file.path)?;
+    let parsed_units = parser.parse_file(&relative_path, &source, file.language)?;
 
     if parsed_units.is_empty() {
         return Ok(ProcessedFile {
-            path: file.path.clone(),
+            path: relative_path,
             language: file.language,
             file_hash,
             units: Vec::new(),
         });
     }
 
-    let units = parsed_units
-        .into_iter()
-        .map(|unit| {
-            let embedding = embedder.embed(&embedding_text(&unit))?;
-            Ok(IndexedCodeUnit {
-                unit,
-                embedding: Some(embedding),
-                file_hash: Some(file_hash.clone()),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let units = build_indexed_units(parsed_units, &file_hash, embedder)?;
 
     Ok(ProcessedFile {
-        path: file.path.clone(),
+        path: relative_path,
         language: file.language,
         file_hash,
         units,
     })
-}
-
-fn embedding_text(unit: &CodeUnit) -> String {
-    match unit.doc.as_deref() {
-        Some(doc) if !doc.is_empty() => format!("{} {} {}", unit.signature, doc, unit.content),
-        _ => format!("{} {}", unit.signature, unit.content),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -223,7 +211,7 @@ mod tests {
     mod git_fixture {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../tests/test_support/git_fixture.rs"
+            "/tests/test_support/git_fixture.rs"
         ));
     }
 
