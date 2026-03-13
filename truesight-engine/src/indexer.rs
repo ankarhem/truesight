@@ -92,25 +92,19 @@ where
 
         let mut indexed_units = Vec::new();
         let mut language_counts = HashMap::new();
-        let mut files_indexed = 0_u32;
         let mut symbols_extracted = 0_u32;
         let mut chunks_embedded = 0_u32;
 
         for file in &processed {
-            if file.units.is_empty() {
-                continue;
-            }
-
-            files_indexed += 1;
+            *language_counts.entry(file.language).or_insert(0) += 1;
             symbols_extracted += file.units.len() as u32;
             chunks_embedded += file.units.len() as u32;
-            *language_counts.entry(file.language).or_insert(0) += 1;
             indexed_units.extend(file.units.iter().cloned());
         }
+        let files_indexed = processed.len() as u32;
 
         let indexed_files = processed
             .iter()
-            .filter(|file| !file.units.is_empty())
             .map(|file| IndexedFileRecord {
                 file_path: file.path.clone(),
                 file_hash: file.file_hash.clone(),
@@ -479,6 +473,41 @@ mod tests {
             .expect("metadata should be recorded");
         assert_eq!(metadata.file_count, 1);
         assert_eq!(metadata.symbol_count, 1);
+    }
+
+    #[tokio::test]
+    async fn index_repo_tracks_supported_files_without_public_symbols() {
+        let temp_dir = TempDir::new().expect("temp dir should exist");
+        init_empty_git_repo(temp_dir.path());
+        fs::create_dir_all(temp_dir.path().join("src")).expect("src dir should exist");
+        fs::write(
+            temp_dir.path().join("src/internal.rs"),
+            "fn hidden_example() -> bool { true }\n",
+        )
+        .expect("source write should succeed");
+
+        let storage = RecordingStorage::default();
+        let stats = index_repo(temp_dir.path(), &storage, &FakeEmbedder)
+            .await
+            .expect("private-only file should index successfully");
+
+        assert_eq!(stats.files_scanned, 1);
+        assert_eq!(stats.files_indexed, 1);
+        assert_eq!(stats.files_skipped, 0);
+        assert_eq!(stats.symbols_extracted, 0);
+        assert_eq!(stats.chunks_embedded, 0);
+        assert_eq!(stats.languages.get(&Language::Rust), Some(&1));
+
+        let state = storage.state.lock().expect("storage lock poisoned");
+        assert!(state.stored_units.is_empty());
+        assert_eq!(state.indexed_files.len(), 1);
+        assert_eq!(
+            state.indexed_files[0].file_path,
+            PathBuf::from("src/internal.rs")
+        );
+        let metadata = state.metadata.clone().expect("metadata should be recorded");
+        assert_eq!(metadata.file_count, 1);
+        assert_eq!(metadata.symbol_count, 0);
     }
 
     #[tokio::test]
