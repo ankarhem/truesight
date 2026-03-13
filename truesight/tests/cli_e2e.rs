@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-#[path = "../../tests/test_support/git_fixture.rs"]
+#[path = "test_support/git_fixture.rs"]
 mod git_fixture;
 
 use git_fixture::TempGitFixture;

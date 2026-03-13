@@ -640,7 +640,7 @@ mod tests {
     mod git_fixture {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../tests/test_support/git_fixture.rs"
+            "/tests/test_support/git_fixture.rs"
         ));
     }
 
