@@ -8,8 +8,8 @@ use chrono::{DateTime, Utc};
 use libsql::{Connection, Database as LibsqlDatabase, params};
 use sha2::{Digest, Sha256};
 use truesight_core::{
-    CodeUnit, CodeUnitKind, IncrementalStorage, IndexMetadata, IndexStorage, IndexedCodeUnit,
-    IndexedFileRecord, Language, MatchType, RankedResult, Result, Storage, TruesightError,
+    CodeUnit, IncrementalStorage, IndexMetadata, IndexStorage, IndexedCodeUnit, IndexedFileRecord,
+    MatchType, RankedResult, Result, Storage, TruesightError,
 };
 
 const MIGRATION_TABLE_SQL: &str = r#"
@@ -101,6 +101,7 @@ pub enum DatabaseError {
     InvalidTimestamp(String),
     InvalidEmbeddingLength(usize),
     InvalidEmbedding(String),
+    InvalidEnumValue(String),
 }
 
 impl std::fmt::Display for DatabaseError {
@@ -114,6 +115,7 @@ impl std::fmt::Display for DatabaseError {
                 write!(f, "invalid embedding blob length: {length}")
             }
             Self::InvalidEmbedding(message) => write!(f, "invalid embedding: {message}"),
+            Self::InvalidEnumValue(message) => write!(f, "invalid stored value: {message}"),
         }
     }
 }
@@ -204,70 +206,9 @@ impl Database {
             .map_err(DatabaseError::from)?;
 
         for entry in units {
-            let unit_id = code_unit_id(repo_id, branch, &entry.unit);
-            let embedding_blob = entry
-                .embedding
-                .as_deref()
-                .map(encode_embedding)
-                .transpose()
-                .map_err(TruesightError::from)?;
-            let file_hash = entry
-                .file_hash
-                .clone()
-                .unwrap_or_else(|| default_file_hash(&entry.unit));
-
-            transaction
-                .execute(
-                    r#"
-                    INSERT INTO code_units (
-                        id,
-                        repo_id,
-                        branch,
-                        file_path,
-                        name,
-                        kind,
-                        signature,
-                        doc,
-                        content,
-                        parent,
-                        language,
-                        line_start,
-                        line_end,
-                        embedding,
-                        file_hash
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                    ON CONFLICT(repo_id, branch, file_path, name, kind, line_start) DO UPDATE SET
-                        id = excluded.id,
-                        signature = excluded.signature,
-                        doc = excluded.doc,
-                        content = excluded.content,
-                        parent = excluded.parent,
-                        language = excluded.language,
-                        line_end = excluded.line_end,
-                        embedding = excluded.embedding,
-                        file_hash = excluded.file_hash
-                    "#,
-                    params![
-                        unit_id,
-                        repo_id,
-                        branch,
-                        path_to_string(&entry.unit.file_path),
-                        entry.unit.name.clone(),
-                        code_unit_kind_to_str(entry.unit.kind),
-                        entry.unit.signature.clone(),
-                        entry.unit.doc.clone(),
-                        entry.unit.content.clone(),
-                        entry.unit.parent.clone(),
-                        language_to_str(entry.unit.language),
-                        i64::from(entry.unit.line_start),
-                        i64::from(entry.unit.line_end),
-                        embedding_blob,
-                        file_hash,
-                    ],
-                )
+            insert_code_unit(&transaction, repo_id, branch, entry)
                 .await
-                .map_err(DatabaseError::from)?;
+                .map_err(TruesightError::from)?;
         }
 
         transaction.commit().await.map_err(DatabaseError::from)?;
@@ -335,70 +276,9 @@ impl Database {
             .map_err(DatabaseError::from)?;
 
         for entry in units {
-            let unit_id = code_unit_id(repo_id, branch, &entry.unit);
-            let embedding_blob = entry
-                .embedding
-                .as_deref()
-                .map(encode_embedding)
-                .transpose()
-                .map_err(TruesightError::from)?;
-            let file_hash = entry
-                .file_hash
-                .clone()
-                .unwrap_or_else(|| default_file_hash(&entry.unit));
-
-            transaction
-                .execute(
-                    r#"
-                    INSERT INTO code_units (
-                        id,
-                        repo_id,
-                        branch,
-                        file_path,
-                        name,
-                        kind,
-                        signature,
-                        doc,
-                        content,
-                        parent,
-                        language,
-                        line_start,
-                        line_end,
-                        embedding,
-                        file_hash
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                    ON CONFLICT(repo_id, branch, file_path, name, kind, line_start) DO UPDATE SET
-                        id = excluded.id,
-                        signature = excluded.signature,
-                        doc = excluded.doc,
-                        content = excluded.content,
-                        parent = excluded.parent,
-                        language = excluded.language,
-                        line_end = excluded.line_end,
-                        embedding = excluded.embedding,
-                        file_hash = excluded.file_hash
-                    "#,
-                    params![
-                        unit_id,
-                        repo_id,
-                        branch,
-                        path_to_string(&entry.unit.file_path),
-                        entry.unit.name.clone(),
-                        code_unit_kind_to_str(entry.unit.kind),
-                        entry.unit.signature.clone(),
-                        entry.unit.doc.clone(),
-                        entry.unit.content.clone(),
-                        entry.unit.parent.clone(),
-                        language_to_str(entry.unit.language),
-                        i64::from(entry.unit.line_start),
-                        i64::from(entry.unit.line_end),
-                        embedding_blob,
-                        file_hash,
-                    ],
-                )
+            insert_code_unit(&transaction, repo_id, branch, entry)
                 .await
-                .map_err(DatabaseError::from)?;
+                .map_err(TruesightError::from)?;
         }
 
         for file in indexed_files {
@@ -1040,7 +920,7 @@ fn code_unit_id(repo_id: &str, branch: &str, unit: &CodeUnit) -> String {
             "{repo_id}\u{1f}{branch}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
             path_to_string(&unit.file_path),
             unit.name,
-            code_unit_kind_to_str(unit.kind),
+            unit.kind,
             unit.line_start,
         )
         .as_bytes(),
@@ -1055,60 +935,75 @@ fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn language_to_str(language: Language) -> &'static str {
-    match language {
-        Language::Rust => "rust",
-        Language::TypeScript => "typescript",
-        Language::CSharp => "csharp",
-    }
-}
+const UPSERT_CODE_UNIT_SQL: &str = r#"
+    INSERT INTO code_units (
+        id, repo_id, branch, file_path, name, kind, signature,
+        doc, content, parent, language, line_start, line_end,
+        embedding, file_hash
+    )
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+    ON CONFLICT(repo_id, branch, file_path, name, kind, line_start) DO UPDATE SET
+        id = excluded.id,
+        signature = excluded.signature,
+        doc = excluded.doc,
+        content = excluded.content,
+        parent = excluded.parent,
+        language = excluded.language,
+        line_end = excluded.line_end,
+        embedding = excluded.embedding,
+        file_hash = excluded.file_hash
+"#;
 
-fn parse_language(value: &str) -> std::result::Result<Language, DatabaseError> {
-    match value {
-        "rust" => Ok(Language::Rust),
-        "typescript" => Ok(Language::TypeScript),
-        "csharp" => Ok(Language::CSharp),
-        other => Err(DatabaseError::InvalidEmbedding(format!(
-            "unknown language value {other}"
-        ))),
-    }
-}
+async fn insert_code_unit(
+    tx: &libsql::Transaction,
+    repo_id: &str,
+    branch: &str,
+    entry: &IndexedCodeUnit,
+) -> std::result::Result<(), DatabaseError> {
+    let unit_id = code_unit_id(repo_id, branch, &entry.unit);
+    let embedding_blob = entry
+        .embedding
+        .as_deref()
+        .map(encode_embedding)
+        .transpose()?;
+    let file_hash = entry
+        .file_hash
+        .clone()
+        .unwrap_or_else(|| default_file_hash(&entry.unit));
 
-fn code_unit_kind_to_str(kind: CodeUnitKind) -> &'static str {
-    match kind {
-        CodeUnitKind::Function => "function",
-        CodeUnitKind::Method => "method",
-        CodeUnitKind::Struct => "struct",
-        CodeUnitKind::Enum => "enum",
-        CodeUnitKind::Trait => "trait",
-        CodeUnitKind::Class => "class",
-        CodeUnitKind::Interface => "interface",
-        CodeUnitKind::Constant => "constant",
-        CodeUnitKind::Module => "module",
-    }
-}
-
-fn parse_code_unit_kind(value: &str) -> std::result::Result<CodeUnitKind, DatabaseError> {
-    match value {
-        "function" => Ok(CodeUnitKind::Function),
-        "method" => Ok(CodeUnitKind::Method),
-        "struct" => Ok(CodeUnitKind::Struct),
-        "enum" => Ok(CodeUnitKind::Enum),
-        "trait" => Ok(CodeUnitKind::Trait),
-        "class" => Ok(CodeUnitKind::Class),
-        "interface" => Ok(CodeUnitKind::Interface),
-        "constant" => Ok(CodeUnitKind::Constant),
-        "module" => Ok(CodeUnitKind::Module),
-        other => Err(DatabaseError::InvalidEmbedding(format!(
-            "unknown code unit kind value {other}"
-        ))),
-    }
+    tx.execute(
+        UPSERT_CODE_UNIT_SQL,
+        params![
+            unit_id,
+            repo_id,
+            branch,
+            path_to_string(&entry.unit.file_path),
+            entry.unit.name.clone(),
+            entry.unit.kind.to_string(),
+            entry.unit.signature.clone(),
+            entry.unit.doc.clone(),
+            entry.unit.content.clone(),
+            entry.unit.parent.clone(),
+            entry.unit.language.to_string(),
+            i64::from(entry.unit.line_start),
+            i64::from(entry.unit.line_end),
+            embedding_blob,
+            file_hash,
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 fn code_unit_from_row(row: &libsql::Row, offset: i32) -> Result<CodeUnit> {
+    let kind_str = row.get::<String>(offset + 1).map_err(DatabaseError::from)?;
+    let lang_str = row.get::<String>(offset + 9).map_err(DatabaseError::from)?;
+
     Ok(CodeUnit {
         name: row.get::<String>(offset).map_err(DatabaseError::from)?,
-        kind: parse_code_unit_kind(&row.get::<String>(offset + 1).map_err(DatabaseError::from)?)?,
+        kind: kind_str
+            .parse()
+            .map_err(|err: String| DatabaseError::InvalidEnumValue(err))?,
         signature: row.get::<String>(offset + 2).map_err(DatabaseError::from)?,
         doc: row
             .get::<Option<String>>(offset + 3)
@@ -1120,7 +1015,9 @@ fn code_unit_from_row(row: &libsql::Row, offset: i32) -> Result<CodeUnit> {
         parent: row
             .get::<Option<String>>(offset + 8)
             .map_err(DatabaseError::from)?,
-        language: parse_language(&row.get::<String>(offset + 9).map_err(DatabaseError::from)?)?,
+        language: lang_str
+            .parse()
+            .map_err(|err: String| DatabaseError::InvalidEnumValue(err))?,
     })
 }
 

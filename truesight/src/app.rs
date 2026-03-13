@@ -9,9 +9,7 @@ use anyhow::{Context, anyhow};
 use chrono::{Duration, Utc};
 use serde::Serialize;
 use truesight_core::IndexMetadata;
-use truesight_core::{
-    IndexStats, Language, MatchType, RepoMap, SearchConfig, SearchResult, Storage,
-};
+use truesight_core::{IndexStats, RepoMap, SearchConfig, SearchResult, Storage};
 use truesight_db::Database;
 use truesight_engine::{
     IncrementalIndexer, OnnxEmbedder, RepoContext, RepoMapGenerator, SearchEngine,
@@ -490,12 +488,7 @@ fn write_search_output(
         writeln!(
             writer,
             "- {} [{}] {}:{} score={:.3} match={}",
-            result.name,
-            kind_label(result),
-            display_path,
-            result.line,
-            result.score,
-            match_type_label(result.match_type)
+            result.name, result.kind, display_path, result.line, result.score, result.match_type
         )?;
         writeln!(writer, "  signature: {}", result.signature.trim())?;
 
@@ -533,7 +526,7 @@ fn write_repomap_output(writer: &mut dyn Write, response: &RepoMap) -> anyhow::R
                     writer,
                     "  - {} [{}] {}:{} {}",
                     sym.name,
-                    kind_label_raw(sym.kind),
+                    sym.kind,
                     sym.file,
                     sym.line,
                     sym.signature.trim()
@@ -561,32 +554,6 @@ fn display_path(repo_root: &Path, path: &Path) -> String {
 
 fn single_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn kind_label(result: &SearchResult) -> &'static str {
-    kind_label_raw(result.kind)
-}
-
-fn kind_label_raw(kind: truesight_core::CodeUnitKind) -> &'static str {
-    match kind {
-        truesight_core::CodeUnitKind::Function => "function",
-        truesight_core::CodeUnitKind::Method => "method",
-        truesight_core::CodeUnitKind::Struct => "struct",
-        truesight_core::CodeUnitKind::Enum => "enum",
-        truesight_core::CodeUnitKind::Trait => "trait",
-        truesight_core::CodeUnitKind::Class => "class",
-        truesight_core::CodeUnitKind::Interface => "interface",
-        truesight_core::CodeUnitKind::Constant => "constant",
-        truesight_core::CodeUnitKind::Module => "module",
-    }
-}
-
-fn match_type_label(match_type: MatchType) -> &'static str {
-    match match_type {
-        MatchType::Fts => "fts",
-        MatchType::Vector => "vector",
-        MatchType::Hybrid => "hybrid",
-    }
 }
 
 fn canonicalize_repo_root(path: &Path) -> anyhow::Result<PathBuf> {
@@ -634,7 +601,7 @@ impl IndexRepoResponse {
     fn from_stats(repo_root: PathBuf, branch: String, stats: IndexStats) -> Self {
         let mut languages = HashMap::new();
         for (language, count) in stats.languages {
-            languages.insert(language_label(language).to_string(), count);
+            languages.insert(language.to_string(), count);
         }
 
         Self {
@@ -662,14 +629,6 @@ pub(crate) struct IndexRepoStats {
     pub(crate) symbols_extracted: u32,
     pub(crate) chunks_embedded: u32,
     pub(crate) duration_ms: u64,
-}
-
-fn language_label(language: Language) -> &'static str {
-    match language {
-        Language::CSharp => "csharp",
-        Language::Rust => "rust",
-        Language::TypeScript => "typescript",
-    }
 }
 
 #[cfg(test)]

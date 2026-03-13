@@ -5,7 +5,6 @@ use std::time::Instant;
 
 use chrono::Utc;
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 use tracing::warn;
 use truesight_core::{
     CodeUnit, Embedder, IndexMetadata, IndexStats, IndexStorage, IndexedCodeUnit,
@@ -14,6 +13,7 @@ use truesight_core::{
 
 use crate::parser::CodeParser;
 use crate::repo_context::detect_repo_context;
+use crate::util::hash_bytes;
 use crate::walker::{DiscoveredFile, FileWalker};
 
 pub(crate) trait FileDiscovery: Send + Sync {
@@ -205,12 +205,6 @@ fn embedding_text(unit: &CodeUnit) -> String {
         Some(doc) if !doc.is_empty() => format!("{} {} {}", unit.signature, doc, unit.content),
         _ => format!("{} {}", unit.signature, unit.content),
     }
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Debug, Clone)]

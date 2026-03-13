@@ -44,15 +44,6 @@ pub fn parse_file(path: &Path, source: &[u8], language: Language) -> Result<Vec<
     CodeParser::new()?.parse_file(path, source, language)
 }
 
-pub fn detect_language(path: &Path) -> Option<Language> {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("rs") => Some(Language::Rust),
-        Some("ts") | Some("tsx") => Some(Language::TypeScript),
-        Some("cs") => Some(Language::CSharp),
-        _ => None,
-    }
-}
-
 fn language_config(language: Language) -> LanguageConfig {
     match language {
         Language::Rust => LanguageConfig {
@@ -635,7 +626,7 @@ mod tests {
     use serde::Deserialize;
     use truesight_core::{CodeUnit, CodeUnitKind, Language};
 
-    use super::{detect_language, parse_file};
+    use super::parse_file;
 
     const FIXTURES_ROOT: &str = "../tests/fixtures";
 
@@ -651,24 +642,24 @@ mod tests {
     }
 
     #[test]
-    fn detect_language_maps_supported_extensions() {
+    fn language_from_path_maps_supported_extensions() {
         assert_eq!(
-            detect_language(Path::new("src/lib.rs")),
+            Language::from_path(Path::new("src/lib.rs")),
             Some(Language::Rust)
         );
         assert_eq!(
-            detect_language(Path::new("src/index.ts")),
+            Language::from_path(Path::new("src/index.ts")),
             Some(Language::TypeScript)
         );
         assert_eq!(
-            detect_language(Path::new("src/component.tsx")),
+            Language::from_path(Path::new("src/component.tsx")),
             Some(Language::TypeScript)
         );
         assert_eq!(
-            detect_language(Path::new("Program.cs")),
+            Language::from_path(Path::new("Program.cs")),
             Some(Language::CSharp)
         );
-        assert_eq!(detect_language(Path::new("README.md")), None);
+        assert_eq!(Language::from_path(Path::new("README.md")), None);
     }
 
     #[test]
@@ -783,7 +774,8 @@ mod tests {
         for relative_path in files {
             let path = fixture_root(fixture_name).join(relative_path);
             let source = fs::read(&path).expect("fixture source should exist");
-            let language = detect_language(&path).expect("fixture file should map to a language");
+            let language =
+                Language::from_path(&path).expect("fixture file should map to a language");
             let mut parsed = parse_file(&path, &source, language).expect("fixture should parse");
             units.append(&mut parsed);
         }

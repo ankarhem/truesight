@@ -13,7 +13,7 @@ use rmcp::{
     transport::io::stdio,
 };
 use serde::{Deserialize, Serialize};
-use truesight_core::{CodeUnitKind, MatchType, RepoMap};
+use truesight_core::RepoMap;
 
 use crate::app::{AppServices, IndexRepoResponse, IndexRepoStats, SearchRepoResponse};
 
@@ -213,7 +213,7 @@ impl From<truesight_core::SymbolInfo> for SymbolInfoResponse {
     fn from(value: truesight_core::SymbolInfo) -> Self {
         Self {
             name: value.name,
-            kind: kind_label(value.kind).to_string(),
+            kind: value.kind.to_string(),
             signature: value.signature,
             doc: value.doc,
             file: value.file,
@@ -259,7 +259,7 @@ struct SearchResultResponse {
 impl From<truesight_core::SearchResult> for SearchResultResponse {
     fn from(value: truesight_core::SearchResult) -> Self {
         Self {
-            kind: kind_label(value.kind).to_string(),
+            kind: value.kind.to_string(),
             name: value.name,
             path: value.path,
             line: value.line,
@@ -267,7 +267,7 @@ impl From<truesight_core::SearchResult> for SearchResultResponse {
             doc: value.doc,
             snippet: value.snippet,
             score: value.score,
-            match_type: match_type_label(value.match_type).to_string(),
+            match_type: value.match_type.to_string(),
         }
     }
 }
@@ -348,28 +348,6 @@ pub async fn run() -> anyhow::Result<()> {
     TruesightMcp::new().serve_stdio().await
 }
 
-fn kind_label(kind: CodeUnitKind) -> &'static str {
-    match kind {
-        CodeUnitKind::Function => "function",
-        CodeUnitKind::Method => "method",
-        CodeUnitKind::Struct => "struct",
-        CodeUnitKind::Enum => "enum",
-        CodeUnitKind::Trait => "trait",
-        CodeUnitKind::Class => "class",
-        CodeUnitKind::Interface => "interface",
-        CodeUnitKind::Constant => "constant",
-        CodeUnitKind::Module => "module",
-    }
-}
-
-fn match_type_label(match_type: MatchType) -> &'static str {
-    match match_type {
-        MatchType::Fts => "fts",
-        MatchType::Vector => "vector",
-        MatchType::Hybrid => "hybrid",
-    }
-}
-
 fn non_negative_integer_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({
         "type": "integer",
@@ -393,7 +371,7 @@ mod tests {
     use std::pin::Pin;
 
     use super::*;
-    use truesight_core::{ModuleInfo, SearchResult, SymbolInfo};
+    use truesight_core::{CodeUnitKind, MatchType, ModuleInfo, SearchResult, SymbolInfo};
 
     #[derive(Clone, Default)]
     struct FakeApp;

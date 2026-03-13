@@ -137,7 +137,7 @@ fn is_allowed_entry(entry: &ignore::DirEntry) -> bool {
 }
 
 fn classify_entry(path: &Path, max_file_size: u64) -> Result<Option<DiscoveredFile>> {
-    let Some(language) = detect_language(path) else {
+    let Some(language) = Language::from_path(path) else {
         return Ok(None);
     };
 
@@ -171,15 +171,6 @@ fn has_excluded_component(path: &Path) -> bool {
 fn component_name(component: Component<'_>) -> Option<&str> {
     match component {
         Component::Normal(name) => name.to_str(),
-        _ => None,
-    }
-}
-
-fn detect_language(path: &Path) -> Option<Language> {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("rs") => Some(Language::Rust),
-        Some("ts") | Some("tsx") => Some(Language::TypeScript),
-        Some("cs") => Some(Language::CSharp),
         _ => None,
     }
 }
@@ -368,24 +359,24 @@ mod tests {
     }
 
     #[test]
-    fn detect_language_maps_supported_extensions() {
+    fn language_from_path_maps_supported_extensions() {
         assert_eq!(
-            detect_language(Path::new("src/lib.rs")),
+            Language::from_path(Path::new("src/lib.rs")),
             Some(Language::Rust)
         );
         assert_eq!(
-            detect_language(Path::new("src/index.ts")),
+            Language::from_path(Path::new("src/index.ts")),
             Some(Language::TypeScript)
         );
         assert_eq!(
-            detect_language(Path::new("src/view.tsx")),
+            Language::from_path(Path::new("src/view.tsx")),
             Some(Language::TypeScript)
         );
         assert_eq!(
-            detect_language(Path::new("src/Program.cs")),
+            Language::from_path(Path::new("src/Program.cs")),
             Some(Language::CSharp)
         );
-        assert_eq!(detect_language(Path::new("README.md")), None);
+        assert_eq!(Language::from_path(Path::new("README.md")), None);
     }
 
     fn fixture_path(name: &str) -> PathBuf {

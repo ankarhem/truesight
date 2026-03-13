@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use sha2::{Digest, Sha256};
 use truesight_core::{
     Embedder, IncrementalStorage, IndexMetadata, IndexStats, IndexedCodeUnit, Language, Result,
     TruesightError,
 };
 
-use crate::parser::{detect_language, parse_file};
+use crate::parser::parse_file;
 use crate::repo_context::{RepoContext, detect_repo_context};
+use crate::util::hash_bytes;
 use crate::walker::FileWalker;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -260,7 +260,7 @@ impl IncrementalIndexer {
         accumulators: &mut IndexAccumulators,
     ) -> Result<()> {
         let absolute_path = ctx.root.join(relative_path);
-        let language = detect_language(relative_path).ok_or_else(|| {
+        let language = Language::from_path(relative_path).ok_or_else(|| {
             TruesightError::Index(format!(
                 "unsupported language for {}",
                 relative_path.display()
@@ -316,7 +316,7 @@ fn git_changes(root: &Path, last_sha: &str) -> Result<ChangeSet> {
             TruesightError::Git(format!("missing path in git diff output line: {line}"))
         })?;
         let path = PathBuf::from(path);
-        if detect_language(&path).is_none() {
+        if Language::from_path(&path).is_none() {
             continue;
         }
 
@@ -367,12 +367,6 @@ fn relativize(root: &Path, path: &Path) -> Result<PathBuf> {
 fn hash_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path)?;
     Ok(hash_bytes(&bytes))
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ pub mod parser;
 pub mod repo_context;
 pub mod repomap;
 pub mod search;
+pub(crate) mod util;
 pub mod walker;
 
 pub use embed::OnnxEmbedder;
