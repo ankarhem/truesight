@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -8,14 +7,19 @@ use rmcp::{
     Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    schemars::{JsonSchema, Schema, SchemaGenerator, json_schema},
     tool, tool_handler, tool_router,
     transport::io::stdio,
 };
-use serde::{Deserialize, Serialize};
 use truesight_core::RepoMap;
 
-use crate::app::{AppServices, IndexRepoResponse, IndexRepoStats, SearchRepoResponse};
+use crate::app::{AppServices, IndexRepoResponse, SearchRepoResponse};
+
+mod types;
+
+use types::{
+    IndexRepoRequest, IndexRepoToolResponse, RepoMapRequest, RepoMapToolResponse,
+    SearchRepoRequest, SearchRepoToolResponse,
+};
 
 type AppFuture<T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'static>>;
 
@@ -117,7 +121,7 @@ impl TruesightMcp {
     }
 
     #[tool(
-        description = "Refresh repository search data when results are missing or stale; use this to repair or warm the index for search_repo and repo_map"
+        description = "Refresh repository search data when results are missing, stale, or after major repository changes; use this to repair or warm the index for search_repo and repo_map"
     )]
     async fn index_repo(
         &self,
@@ -129,198 +133,6 @@ impl TruesightMcp {
             .await
             .map_err(|error| error.to_string())?;
         Ok(Json(response.into()))
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct RepoMapRequest {
-    #[schemars(description = "Path to the repository root")]
-    path: String,
-    #[schemars(
-        description = "Optional repo-relative path prefix to limit the map to a directory or file"
-    )]
-    filter: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct SearchRepoRequest {
-    #[schemars(description = "Natural language search query")]
-    query: String,
-    #[schemars(description = "Path to the repository root")]
-    path: String,
-    #[schemars(description = "Maximum number of results to return")]
-    #[schemars(schema_with = "non_negative_integer_schema")]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct IndexRepoRequest {
-    #[schemars(description = "Path to the repository root")]
-    path: String,
-    #[schemars(description = "Force a full reindex instead of incremental refresh")]
-    full: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct RepoMapToolResponse {
-    repo_root: PathBuf,
-    branch: String,
-    modules: Vec<ModuleInfoResponse>,
-}
-
-impl From<RepoMap> for RepoMapToolResponse {
-    fn from(value: RepoMap) -> Self {
-        Self {
-            repo_root: value.repo_root,
-            branch: value.branch,
-            modules: value.modules.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct ModuleInfoResponse {
-    name: String,
-    path: PathBuf,
-    files: Vec<String>,
-    symbols: Vec<SymbolInfoResponse>,
-    depends_on: Vec<String>,
-}
-
-impl From<truesight_core::ModuleInfo> for ModuleInfoResponse {
-    fn from(value: truesight_core::ModuleInfo) -> Self {
-        Self {
-            name: value.name,
-            path: value.path,
-            files: value.files,
-            symbols: value.symbols.into_iter().map(Into::into).collect(),
-            depends_on: value.depends_on,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct SymbolInfoResponse {
-    name: String,
-    kind: String,
-    signature: String,
-    doc: Option<String>,
-    file: String,
-    #[schemars(schema_with = "non_negative_integer_schema")]
-    line: u32,
-}
-
-impl From<truesight_core::SymbolInfo> for SymbolInfoResponse {
-    fn from(value: truesight_core::SymbolInfo) -> Self {
-        Self {
-            name: value.name,
-            kind: value.kind.to_string(),
-            signature: value.signature,
-            doc: value.doc,
-            file: value.file,
-            line: value.line,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct SearchRepoToolResponse {
-    query: String,
-    results: Vec<SearchResultResponse>,
-    #[schemars(schema_with = "non_negative_integer_schema")]
-    total_results: usize,
-    search_mode: String,
-}
-
-impl From<SearchRepoResponse> for SearchRepoToolResponse {
-    fn from(value: SearchRepoResponse) -> Self {
-        Self {
-            query: value.query,
-            results: value.results.into_iter().map(Into::into).collect(),
-            total_results: value.total_results,
-            search_mode: value.search_mode,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct SearchResultResponse {
-    kind: String,
-    name: String,
-    path: PathBuf,
-    #[schemars(schema_with = "non_negative_integer_schema")]
-    line: u32,
-    signature: String,
-    doc: Option<String>,
-    snippet: String,
-    score: f32,
-    match_type: String,
-}
-
-impl From<truesight_core::SearchResult> for SearchResultResponse {
-    fn from(value: truesight_core::SearchResult) -> Self {
-        Self {
-            kind: value.kind.to_string(),
-            name: value.name,
-            path: value.path,
-            line: value.line,
-            signature: value.signature,
-            doc: value.doc,
-            snippet: value.snippet,
-            score: value.score,
-            match_type: value.match_type.to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct IndexRepoToolResponse {
-    status: String,
-    repo_root: PathBuf,
-    branch: String,
-    stats: IndexRepoStatsResponse,
-    #[schemars(schema_with = "string_to_non_negative_integer_map_schema")]
-    languages: HashMap<String, u32>,
-}
-
-impl From<IndexRepoResponse> for IndexRepoToolResponse {
-    fn from(value: IndexRepoResponse) -> Self {
-        Self {
-            status: value.status,
-            repo_root: value.repo_root,
-            branch: value.branch,
-            stats: value.stats.into(),
-            languages: value.languages,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct IndexRepoStatsResponse {
-    #[schemars(schema_with = "non_negative_integer_schema")]
-    files_scanned: u32,
-    #[schemars(schema_with = "non_negative_integer_schema")]
-    files_indexed: u32,
-    #[schemars(schema_with = "non_negative_integer_schema")]
-    files_skipped: u32,
-    #[schemars(schema_with = "non_negative_integer_schema")]
-    symbols_extracted: u32,
-    #[schemars(schema_with = "non_negative_integer_schema")]
-    chunks_embedded: u32,
-    #[schemars(schema_with = "non_negative_integer_schema")]
-    duration_ms: u64,
-}
-
-impl From<IndexRepoStats> for IndexRepoStatsResponse {
-    fn from(value: IndexRepoStats) -> Self {
-        Self {
-            files_scanned: value.files_scanned,
-            files_indexed: value.files_indexed,
-            files_skipped: value.files_skipped,
-            symbols_extracted: value.symbols_extracted,
-            chunks_embedded: value.chunks_embedded,
-            duration_ms: value.duration_ms,
-        }
     }
 }
 
@@ -349,23 +161,6 @@ pub async fn run() -> anyhow::Result<()> {
     TruesightMcp::new().serve_stdio().await
 }
 
-fn non_negative_integer_schema(_: &mut SchemaGenerator) -> Schema {
-    json_schema!({
-        "type": "integer",
-        "minimum": 0,
-    })
-}
-
-fn string_to_non_negative_integer_map_schema(_: &mut SchemaGenerator) -> Schema {
-    json_schema!({
-        "type": "object",
-        "additionalProperties": {
-            "type": "integer",
-            "minimum": 0,
-        },
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,7 +176,7 @@ mod tests {
                         status: String::from("completed"),
                         repo_root: path,
                         branch: String::from("main"),
-                        stats: IndexRepoStats {
+                        stats: crate::app::IndexRepoStats {
                             files_scanned: 2,
                             files_indexed: 2,
                             files_skipped: 0,
@@ -389,7 +184,7 @@ mod tests {
                             chunks_embedded: 3,
                             duration_ms: 12,
                         },
-                        languages: HashMap::from([(String::from("rust"), 2)]),
+                        languages: std::collections::HashMap::from([(String::from("rust"), 2)]),
                     })
                 })
             });
