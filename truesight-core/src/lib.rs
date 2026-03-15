@@ -355,6 +355,43 @@ pub struct IndexStats {
     pub languages: HashMap<Language, u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexStatus {
+    Indexing,
+    Ready,
+    Failed,
+}
+
+impl Default for IndexStatus {
+    fn default() -> Self {
+        Self::Ready
+    }
+}
+
+impl std::fmt::Display for IndexStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IndexStatus::Indexing => write!(f, "indexing"),
+            IndexStatus::Ready => write!(f, "ready"),
+            IndexStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+impl std::str::FromStr for IndexStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "indexing" => Ok(IndexStatus::Indexing),
+            "ready" => Ok(IndexStatus::Ready),
+            "failed" => Ok(IndexStatus::Failed),
+            other => Err(format!("unknown index status: {other}")),
+        }
+    }
+}
+
 /// Metadata about an indexed repository/branch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMetadata {
@@ -362,14 +399,18 @@ pub struct IndexMetadata {
     pub repo_id: String,
     /// Branch name.
     pub branch: String,
+    pub status: IndexStatus,
     /// When this index was last updated.
     pub last_indexed_at: chrono::DateTime<chrono::Utc>,
     /// Git commit SHA at time of indexing (if applicable).
     pub last_commit_sha: Option<String>,
+    pub last_seen_commit_sha: Option<String>,
     /// Number of files in the index.
     pub file_count: u32,
     /// Number of symbols in the index.
     pub symbol_count: u32,
+    pub embedding_model: String,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,7 +424,33 @@ pub struct IndexedCodeUnit {
 pub struct IndexedFileRecord {
     pub file_path: PathBuf,
     pub file_hash: String,
+    pub chunk_count: u32,
     pub indexed_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingEmbedding {
+    pub id: String,
+    pub signature: String,
+    pub doc: Option<String>,
+    pub content: String,
+}
+
+impl PendingEmbedding {
+    pub fn embedding_text(&self) -> String {
+        match self.doc.as_deref() {
+            Some(doc) if !doc.is_empty() => {
+                format!("{} {} {}", self.signature, doc, self.content)
+            }
+            _ => format!("{} {}", self.signature, self.content),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingUpdate {
+    pub id: String,
+    pub embedding: Vec<f32>,
 }
 
 // =============================================================================
@@ -415,12 +482,24 @@ pub trait Storage: Send + Sync {
         limit: usize,
     ) -> Result<Vec<RankedResult>>;
 
+    async fn search_hybrid(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        query: &str,
+        embedding: &[f32],
+        limit: usize,
+        rrf_k: u32,
+    ) -> Result<Vec<RankedResult>>;
+
     /// Get metadata for an indexed repository/branch.
     async fn get_index_metadata(
         &self,
         repo_id: &str,
         branch: &str,
     ) -> Result<Option<IndexMetadata>>;
+
+    async fn has_indexed_symbols(&self, repo_id: &str, branch: &str) -> Result<bool>;
 
     /// Set/update metadata for an indexed repository/branch.
     async fn set_index_metadata(
@@ -452,6 +531,23 @@ pub trait IndexStorage: Storage {
         branch: &str,
         file_path: &Path,
         file_hash: &str,
+        chunk_count: u32,
+    ) -> Result<()>;
+
+    async fn list_pending_embeddings(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        embedding_model: &str,
+        limit: usize,
+    ) -> Result<Vec<PendingEmbedding>>;
+
+    async fn update_embeddings(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        embedding_model: &str,
+        updates: &[EmbeddingUpdate],
     ) -> Result<()>;
 
     async fn replace_branch_index(
@@ -469,8 +565,14 @@ pub trait IndexStorage: Storage {
         }
 
         for file in indexed_files {
-            self.upsert_indexed_file(repo_id, branch, &file.file_path, &file.file_hash)
-                .await?;
+            self.upsert_indexed_file(
+                repo_id,
+                branch,
+                &file.file_path,
+                &file.file_hash,
+                file.chunk_count,
+            )
+            .await?;
         }
 
         self.set_index_metadata(repo_id, branch, metadata).await
@@ -510,6 +612,10 @@ pub trait Embedder: Send + Sync {
 
     /// Get the dimension of the embedding vectors.
     fn dimension(&self) -> usize;
+
+    fn model_name(&self) -> &str {
+        "unknown"
+    }
 }
 
 // =============================================================================
@@ -941,10 +1047,14 @@ mod tests {
         let meta = IndexMetadata {
             repo_id: "/path/to/repo".to_string(),
             branch: "main".to_string(),
+            status: IndexStatus::Ready,
             last_indexed_at: chrono::Utc::now(),
             last_commit_sha: Some("abc123".to_string()),
+            last_seen_commit_sha: Some("abc123".to_string()),
             file_count: 100,
             symbol_count: 500,
+            embedding_model: "all-MiniLM-L6-v2".to_string(),
+            last_error: None,
         };
 
         let json = serde_json::to_string(&meta).expect("Failed to serialize");
@@ -953,8 +1063,12 @@ mod tests {
 
         assert_eq!(deserialized.repo_id, meta.repo_id);
         assert_eq!(deserialized.branch, meta.branch);
+        assert_eq!(deserialized.status, meta.status);
         assert_eq!(deserialized.last_commit_sha, meta.last_commit_sha);
+        assert_eq!(deserialized.last_seen_commit_sha, meta.last_seen_commit_sha);
         assert_eq!(deserialized.file_count, meta.file_count);
         assert_eq!(deserialized.symbol_count, meta.symbol_count);
+        assert_eq!(deserialized.embedding_model, meta.embedding_model);
+        assert_eq!(deserialized.last_error, meta.last_error);
     }
 }

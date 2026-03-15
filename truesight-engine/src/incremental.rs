@@ -5,10 +5,11 @@ use std::process::Command;
 use std::time::Instant;
 
 use truesight_core::{
-    Embedder, IncrementalStorage, IndexMetadata, IndexStats, Language, Result, TruesightError,
+    Embedder, IncrementalStorage, IndexMetadata, IndexStats, IndexStatus, Language, Result,
+    TruesightError,
 };
 
-use crate::indexing::{build_indexed_units, repo_relative_path};
+use crate::indexing::{build_pending_units, materialize_embeddings, repo_relative_path};
 use crate::parser::parse_file;
 use crate::repo_context::{RepoContext, detect_repo_context};
 use crate::util::hash_bytes;
@@ -143,6 +144,9 @@ impl IncrementalIndexer {
             self.index_one_file(&ctx, added, &mut accumulators).await?;
         }
 
+        accumulators.chunks_embedded =
+            materialize_embeddings(ctx.storage, ctx.repo_id, ctx.branch, ctx.embedder).await?;
+
         let all_symbols = ctx.storage.get_all_symbols(ctx.repo_id, ctx.branch).await?;
         let indexed_files = ctx
             .storage
@@ -151,10 +155,14 @@ impl IncrementalIndexer {
         let metadata = IndexMetadata {
             repo_id: ctx.repo_id.to_string(),
             branch: ctx.branch.to_string(),
+            status: IndexStatus::Ready,
             last_indexed_at: chrono::Utc::now(),
             last_commit_sha: current_commit_sha(ctx.root).ok(),
+            last_seen_commit_sha: current_commit_sha(ctx.root).ok(),
             file_count: indexed_files.len() as u32,
             symbol_count: all_symbols.len() as u32,
+            embedding_model: ctx.embedder.model_name().to_string(),
+            last_error: None,
         };
         ctx.storage
             .set_index_metadata(ctx.repo_id, ctx.branch, &metadata)
@@ -269,18 +277,23 @@ impl IncrementalIndexer {
         let source = fs::read(&absolute_path)?;
         let file_hash = hash_bytes(&source);
         let units = parse_file(relative_path, &source, language)?;
-        let stored_units = build_indexed_units(units, &file_hash, ctx.embedder)?;
+        let stored_units = build_pending_units(units, &file_hash);
 
         ctx.storage
             .store_indexed_units(ctx.repo_id, ctx.branch, &stored_units)
             .await?;
         ctx.storage
-            .upsert_indexed_file(ctx.repo_id, ctx.branch, relative_path, &file_hash)
+            .upsert_indexed_file(
+                ctx.repo_id,
+                ctx.branch,
+                relative_path,
+                &file_hash,
+                stored_units.len() as u32,
+            )
             .await?;
 
         *accumulators.languages.entry(language).or_insert(0) += 1;
         accumulators.symbols_extracted += stored_units.len() as u32;
-        accumulators.chunks_embedded += stored_units.len() as u32;
         Ok(())
     }
 }
@@ -384,8 +397,8 @@ mod tests {
     use chrono::Utc;
     use tempfile::TempDir;
     use truesight_core::{
-        Embedder, IncrementalStorage, IndexMetadata, IndexStorage, IndexedCodeUnit,
-        IndexedFileRecord, Language, RankedResult, Storage,
+        Embedder, EmbeddingUpdate, IncrementalStorage, IndexMetadata, IndexStorage,
+        IndexedCodeUnit, IndexedFileRecord, Language, PendingEmbedding, RankedResult, Storage,
     };
 
     #[derive(Clone, Default)]
@@ -440,6 +453,18 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn search_hybrid(
+            &self,
+            _repo_id: &str,
+            _branch: &str,
+            _query: &str,
+            _embedding: &[f32],
+            _limit: usize,
+            _rrf_k: u32,
+        ) -> truesight_core::Result<Vec<RankedResult>> {
+            Ok(Vec::new())
+        }
+
         async fn get_index_metadata(
             &self,
             _repo_id: &str,
@@ -456,6 +481,14 @@ mod tests {
         ) -> truesight_core::Result<()> {
             self.state.lock().unwrap().metadata = Some(meta.clone());
             Ok(())
+        }
+
+        async fn has_indexed_symbols(
+            &self,
+            _repo_id: &str,
+            _branch: &str,
+        ) -> truesight_core::Result<bool> {
+            Ok(!self.state.lock().unwrap().units.is_empty())
         }
 
         async fn delete_branch_index(
@@ -508,6 +541,7 @@ mod tests {
             _branch: &str,
             file_path: &Path,
             file_hash: &str,
+            chunk_count: u32,
         ) -> truesight_core::Result<()> {
             let mut state = self.state.lock().unwrap();
             state
@@ -516,11 +550,56 @@ mod tests {
             state.indexed_files.push(IndexedFileRecord {
                 file_path: file_path.to_path_buf(),
                 file_hash: file_hash.to_string(),
+                chunk_count,
                 indexed_at: Utc::now(),
             });
             state
                 .indexed_files
                 .sort_by(|left, right| left.file_path.cmp(&right.file_path));
+            Ok(())
+        }
+
+        async fn list_pending_embeddings(
+            &self,
+            _repo_id: &str,
+            _branch: &str,
+            _embedding_model: &str,
+            limit: usize,
+        ) -> truesight_core::Result<Vec<PendingEmbedding>> {
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .units
+                .iter()
+                .filter(|entry| entry.embedding.is_none())
+                .take(limit)
+                .map(|entry| PendingEmbedding {
+                    id: pending_id(&entry.unit),
+                    signature: entry.unit.signature.clone(),
+                    doc: entry.unit.doc.clone(),
+                    content: entry.unit.content.clone(),
+                })
+                .collect())
+        }
+
+        async fn update_embeddings(
+            &self,
+            _repo_id: &str,
+            _branch: &str,
+            _embedding_model: &str,
+            updates: &[EmbeddingUpdate],
+        ) -> truesight_core::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            for update in updates {
+                if let Some(entry) = state
+                    .units
+                    .iter_mut()
+                    .find(|entry| pending_id(&entry.unit) == update.id)
+                {
+                    entry.embedding = Some(update.embedding.clone());
+                }
+            }
             Ok(())
         }
     }
@@ -583,6 +662,19 @@ mod tests {
         fn dimension(&self) -> usize {
             4
         }
+
+        fn model_name(&self) -> &str {
+            "fake-model"
+        }
+    }
+
+    fn pending_id(unit: &truesight_core::CodeUnit) -> String {
+        format!(
+            "{}:{}:{}",
+            unit.file_path.display(),
+            unit.name,
+            unit.line_start
+        )
     }
 
     #[tokio::test]

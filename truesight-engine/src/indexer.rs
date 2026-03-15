@@ -7,11 +7,11 @@ use chrono::Utc;
 use rayon::prelude::*;
 use tracing::warn;
 use truesight_core::{
-    CodeUnit, Embedder, IndexMetadata, IndexStats, IndexStorage, IndexedCodeUnit,
+    CodeUnit, Embedder, IndexMetadata, IndexStats, IndexStatus, IndexStorage, IndexedCodeUnit,
     IndexedFileRecord, Language, Result,
 };
 
-use crate::indexing::{build_indexed_units, repo_relative_path};
+use crate::indexing::{build_pending_units, materialize_embeddings, repo_relative_path};
 use crate::parser::CodeParser;
 use crate::repo_context::detect_repo_context;
 use crate::util::hash_bytes;
@@ -80,7 +80,7 @@ where
             .par_iter()
             .enumerate()
             .filter_map(|(index, file)| {
-                match process_file(index + 1, discovered.len(), root, file, &self.parser, embedder) {
+                match process_file(index + 1, discovered.len(), root, file, &self.parser) {
                     Ok(outcome) => Some(outcome),
                     Err(error) => {
                         warn!(path = %file.path.display(), error = %error, "skipping file during indexing");
@@ -93,12 +93,10 @@ where
         let mut indexed_units = Vec::new();
         let mut language_counts = HashMap::new();
         let mut symbols_extracted = 0_u32;
-        let mut chunks_embedded = 0_u32;
 
         for file in &processed {
             *language_counts.entry(file.language).or_insert(0) += 1;
             symbols_extracted += file.units.len() as u32;
-            chunks_embedded += file.units.len() as u32;
             indexed_units.extend(file.units.iter().cloned());
         }
         let files_indexed = processed.len() as u32;
@@ -108,6 +106,7 @@ where
             .map(|file| IndexedFileRecord {
                 file_path: file.path.clone(),
                 file_hash: file.file_hash.clone(),
+                chunk_count: file.units.len() as u32,
                 indexed_at: Utc::now(),
             })
             .collect::<Vec<_>>();
@@ -115,10 +114,14 @@ where
         let metadata = IndexMetadata {
             repo_id: context.repo_id.clone(),
             branch: context.branch.clone(),
+            status: IndexStatus::Ready,
             last_indexed_at: Utc::now(),
             last_commit_sha: context.last_commit_sha.clone(),
+            last_seen_commit_sha: context.last_commit_sha.clone(),
             file_count: files_indexed,
             symbol_count: symbols_extracted,
+            embedding_model: embedder.model_name().to_string(),
+            last_error: None,
         };
 
         storage
@@ -130,6 +133,9 @@ where
                 &metadata,
             )
             .await?;
+
+        let chunks_embedded =
+            materialize_embeddings(storage, &context.repo_id, &context.branch, embedder).await?;
 
         Ok(IndexStats {
             files_scanned,
@@ -151,17 +157,15 @@ where
     Indexer::new()?.index_repo(root, storage, embedder).await
 }
 
-fn process_file<P, E>(
+fn process_file<P>(
     index: usize,
     total: usize,
     root: &Path,
     file: &DiscoveredFile,
     parser: &P,
-    embedder: &E,
 ) -> Result<ProcessedFile>
 where
     P: SourceParser,
-    E: Embedder,
 {
     tracing::info!(file_number = index, total_files = total, path = %file.path.display(), "indexing file");
 
@@ -179,7 +183,7 @@ where
         });
     }
 
-    let units = build_indexed_units(parsed_units, &file_hash, embedder)?;
+    let units = build_pending_units(parsed_units, &file_hash);
 
     Ok(ProcessedFile {
         path: relative_path,
@@ -212,7 +216,8 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::TempDir;
     use truesight_core::{
-        IndexStorage, IndexedCodeUnit, IndexedFileRecord, RankedResult, Storage, TruesightError,
+        EmbeddingUpdate, IndexStorage, IndexedCodeUnit, IndexedFileRecord, PendingEmbedding,
+        RankedResult, Storage, TruesightError,
     };
 
     use super::*;
@@ -262,6 +267,18 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn search_hybrid(
+            &self,
+            _repo_id: &str,
+            _branch: &str,
+            _query: &str,
+            _embedding: &[f32],
+            _limit: usize,
+            _rrf_k: u32,
+        ) -> Result<Vec<RankedResult>> {
+            Ok(Vec::new())
+        }
+
         async fn get_index_metadata(
             &self,
             _repo_id: &str,
@@ -283,6 +300,15 @@ mod tests {
         ) -> Result<()> {
             self.state.lock().expect("storage lock poisoned").metadata = Some(meta.clone());
             Ok(())
+        }
+
+        async fn has_indexed_symbols(&self, _repo_id: &str, _branch: &str) -> Result<bool> {
+            Ok(!self
+                .state
+                .lock()
+                .expect("storage lock poisoned")
+                .stored_units
+                .is_empty())
         }
 
         async fn delete_branch_index(&self, repo_id: &str, branch: &str) -> Result<()> {
@@ -328,6 +354,7 @@ mod tests {
             _branch: &str,
             file_path: &Path,
             file_hash: &str,
+            chunk_count: u32,
         ) -> Result<()> {
             self.state
                 .lock()
@@ -336,8 +363,53 @@ mod tests {
                 .push(IndexedFileRecord {
                     file_path: file_path.to_path_buf(),
                     file_hash: file_hash.to_string(),
+                    chunk_count,
                     indexed_at: Utc::now(),
                 });
+            Ok(())
+        }
+
+        async fn list_pending_embeddings(
+            &self,
+            _repo_id: &str,
+            _branch: &str,
+            _embedding_model: &str,
+            limit: usize,
+        ) -> Result<Vec<PendingEmbedding>> {
+            Ok(self
+                .state
+                .lock()
+                .expect("storage lock poisoned")
+                .stored_units
+                .iter()
+                .filter(|entry| entry.embedding.is_none())
+                .take(limit)
+                .map(|entry| PendingEmbedding {
+                    id: pending_id(&entry.unit),
+                    signature: entry.unit.signature.clone(),
+                    doc: entry.unit.doc.clone(),
+                    content: entry.unit.content.clone(),
+                })
+                .collect())
+        }
+
+        async fn update_embeddings(
+            &self,
+            _repo_id: &str,
+            _branch: &str,
+            _embedding_model: &str,
+            updates: &[EmbeddingUpdate],
+        ) -> Result<()> {
+            let mut state = self.state.lock().expect("storage lock poisoned");
+            for update in updates {
+                if let Some(entry) = state
+                    .stored_units
+                    .iter_mut()
+                    .find(|entry| pending_id(&entry.unit) == update.id)
+                {
+                    entry.embedding = Some(update.embedding.clone());
+                }
+            }
             Ok(())
         }
     }
@@ -357,6 +429,19 @@ mod tests {
         fn dimension(&self) -> usize {
             4
         }
+
+        fn model_name(&self) -> &str {
+            "fake-model"
+        }
+    }
+
+    fn pending_id(unit: &CodeUnit) -> String {
+        format!(
+            "{}:{}:{}",
+            unit.file_path.display(),
+            unit.name,
+            unit.line_start
+        )
     }
 
     struct ControlledParser {

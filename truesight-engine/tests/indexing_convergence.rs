@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tempfile::TempDir;
 use truesight_core::{
-    CodeUnit, Embedder, IncrementalStorage, IndexMetadata, IndexStats, IndexStorage,
-    IndexedCodeUnit, IndexedFileRecord, RankedResult, Storage,
+    CodeUnit, Embedder, EmbeddingUpdate, IncrementalStorage, IndexMetadata, IndexStats,
+    IndexStorage, IndexedCodeUnit, IndexedFileRecord, PendingEmbedding, RankedResult, Storage,
 };
 use truesight_engine::{IncrementalIndexer, detect_repo_context, index_repo};
 
@@ -58,6 +58,18 @@ impl Storage for RecordingStorage {
         Ok(Vec::new())
     }
 
+    async fn search_hybrid(
+        &self,
+        _repo_id: &str,
+        _branch: &str,
+        _query: &str,
+        _embedding: &[f32],
+        _limit: usize,
+        _rrf_k: u32,
+    ) -> truesight_core::Result<Vec<RankedResult>> {
+        Ok(Vec::new())
+    }
+
     async fn get_index_metadata(
         &self,
         _repo_id: &str,
@@ -79,6 +91,19 @@ impl Storage for RecordingStorage {
     ) -> truesight_core::Result<()> {
         self.state.lock().expect("storage lock poisoned").metadata = Some(meta.clone());
         Ok(())
+    }
+
+    async fn has_indexed_symbols(
+        &self,
+        _repo_id: &str,
+        _branch: &str,
+    ) -> truesight_core::Result<bool> {
+        Ok(!self
+            .state
+            .lock()
+            .expect("storage lock poisoned")
+            .units
+            .is_empty())
     }
 
     async fn delete_branch_index(
@@ -131,6 +156,7 @@ impl IndexStorage for RecordingStorage {
         _branch: &str,
         file_path: &Path,
         file_hash: &str,
+        chunk_count: u32,
     ) -> truesight_core::Result<()> {
         let mut state = self.state.lock().expect("storage lock poisoned");
         state
@@ -139,11 +165,56 @@ impl IndexStorage for RecordingStorage {
         state.indexed_files.push(IndexedFileRecord {
             file_path: file_path.to_path_buf(),
             file_hash: file_hash.to_string(),
+            chunk_count,
             indexed_at: Utc::now(),
         });
         state
             .indexed_files
             .sort_by(|left, right| left.file_path.cmp(&right.file_path));
+        Ok(())
+    }
+
+    async fn list_pending_embeddings(
+        &self,
+        _repo_id: &str,
+        _branch: &str,
+        _embedding_model: &str,
+        limit: usize,
+    ) -> truesight_core::Result<Vec<PendingEmbedding>> {
+        Ok(self
+            .state
+            .lock()
+            .expect("storage lock poisoned")
+            .units
+            .iter()
+            .filter(|entry| entry.embedding.is_none())
+            .take(limit)
+            .map(|entry| PendingEmbedding {
+                id: pending_id(&entry.unit),
+                signature: entry.unit.signature.clone(),
+                doc: entry.unit.doc.clone(),
+                content: entry.unit.content.clone(),
+            })
+            .collect())
+    }
+
+    async fn update_embeddings(
+        &self,
+        _repo_id: &str,
+        _branch: &str,
+        _embedding_model: &str,
+        updates: &[EmbeddingUpdate],
+    ) -> truesight_core::Result<()> {
+        let mut state = self.state.lock().expect("storage lock poisoned");
+        for update in updates {
+            if let Some(entry) = state
+                .units
+                .iter_mut()
+                .find(|entry| pending_id(&entry.unit) == update.id)
+            {
+                entry.embedding = Some(update.embedding.clone());
+            }
+        }
         Ok(())
     }
 }
@@ -211,6 +282,19 @@ impl Embedder for FakeEmbedder {
     fn dimension(&self) -> usize {
         4
     }
+
+    fn model_name(&self) -> &str {
+        "fake-model"
+    }
+}
+
+fn pending_id(unit: &CodeUnit) -> String {
+    format!(
+        "{}:{}:{}",
+        unit.file_path.display(),
+        unit.name,
+        unit.line_start
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -637,6 +637,20 @@ mod tests {
             )))
         }
 
+        async fn search_hybrid(
+            &self,
+            _repo_id: &str,
+            _branch: &str,
+            _query: &str,
+            _embedding: &[f32],
+            _limit: usize,
+            _rrf_k: u32,
+        ) -> truesight_core::Result<Vec<RankedResult>> {
+            Err(TruesightError::Index(String::from(
+                "search_hybrid should not be called in repomap tests",
+            )))
+        }
+
         async fn get_index_metadata(
             &self,
             _repo_id: &str,
@@ -655,6 +669,16 @@ mod tests {
         ) -> truesight_core::Result<()> {
             Err(TruesightError::Index(String::from(
                 "set_index_metadata should not be called in repomap tests",
+            )))
+        }
+
+        async fn has_indexed_symbols(
+            &self,
+            _repo_id: &str,
+            _branch: &str,
+        ) -> truesight_core::Result<bool> {
+            Err(TruesightError::Index(String::from(
+                "has_indexed_symbols should not be called in repomap tests",
             )))
         }
 

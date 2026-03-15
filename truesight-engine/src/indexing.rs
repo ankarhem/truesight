@@ -1,7 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use truesight_core::{CodeUnit, Embedder, IndexedCodeUnit, Result, TruesightError};
+use truesight_core::{
+    CodeUnit, Embedder, EmbeddingUpdate, IndexStorage, IndexedCodeUnit, Result, TruesightError,
+};
 
+const EMBEDDING_BATCH_SIZE: usize = 128;
+
+#[cfg(test)]
 pub(crate) fn build_indexed_units<E: Embedder + ?Sized>(
     units: Vec<CodeUnit>,
     file_hash: &str,
@@ -20,10 +25,66 @@ pub(crate) fn build_indexed_units<E: Embedder + ?Sized>(
         .collect()
 }
 
+pub(crate) fn build_pending_units(units: Vec<CodeUnit>, file_hash: &str) -> Vec<IndexedCodeUnit> {
+    units
+        .into_iter()
+        .map(|unit| IndexedCodeUnit {
+            unit,
+            embedding: None,
+            file_hash: Some(file_hash.to_string()),
+        })
+        .collect()
+}
+
+#[cfg(test)]
 pub(crate) fn embedding_text(unit: &CodeUnit) -> String {
     match unit.doc.as_deref() {
         Some(doc) if !doc.is_empty() => format!("{} {} {}", unit.signature, doc, unit.content),
         _ => format!("{} {}", unit.signature, unit.content),
+    }
+}
+
+pub(crate) async fn materialize_embeddings<S, E>(
+    storage: &S,
+    repo_id: &str,
+    branch: &str,
+    embedder: &E,
+) -> Result<u32>
+where
+    S: IndexStorage + ?Sized,
+    E: Embedder + ?Sized,
+{
+    let mut chunks_embedded = 0_u32;
+
+    loop {
+        let pending = storage
+            .list_pending_embeddings(repo_id, branch, embedder.model_name(), EMBEDDING_BATCH_SIZE)
+            .await?;
+
+        if pending.is_empty() {
+            return Ok(chunks_embedded);
+        }
+
+        let texts = pending
+            .iter()
+            .map(|entry| entry.embedding_text())
+            .collect::<Vec<_>>();
+        let text_refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+        let embeddings = embedder.embed_batch(&text_refs)?;
+
+        let updates = pending
+            .into_iter()
+            .zip(embeddings)
+            .map(|(entry, embedding)| EmbeddingUpdate {
+                id: entry.id,
+                embedding,
+            })
+            .collect::<Vec<_>>();
+
+        chunks_embedded += updates.len() as u32;
+        storage
+            .update_embeddings(repo_id, branch, embedder.model_name(), &updates)
+            .await?;
     }
 }
 

@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,9 +8,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use libsql::{Connection, Database as LibsqlDatabase, params};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 use truesight_core::{
-    CodeUnit, IncrementalStorage, IndexMetadata, IndexStorage, IndexedCodeUnit, IndexedFileRecord,
-    MatchType, RankedResult, Result, Storage, TruesightError,
+    CodeUnit, EmbeddingUpdate, IncrementalStorage, IndexMetadata, IndexStatus, IndexStorage,
+    IndexedCodeUnit, IndexedFileRecord, MatchType, PendingEmbedding, RankedResult, Result, Storage,
+    TruesightError,
 };
 
 const MIGRATION_TABLE_SQL: &str = r#"
@@ -91,7 +94,23 @@ CREATE TABLE IF NOT EXISTS indexed_files (
 );
 "#;
 
-const MIGRATIONS: &[(i64, &str, &str)] = &[(1, "initial_schema", SCHEMA)];
+const MIGRATION_ADD_INDEX_STATE_SQL: &str = r#"
+ALTER TABLE index_metadata ADD COLUMN status TEXT NOT NULL DEFAULT 'ready';
+ALTER TABLE index_metadata ADD COLUMN last_seen_commit_sha TEXT;
+ALTER TABLE index_metadata ADD COLUMN embedding_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE index_metadata ADD COLUMN last_error TEXT;
+ALTER TABLE code_units ADD COLUMN embedding_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE indexed_files ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0;
+"#;
+
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "initial_schema", SCHEMA),
+    (
+        2,
+        "add_index_state_and_embedding_metadata",
+        MIGRATION_ADD_INDEX_STATE_SQL,
+    ),
+];
 
 #[derive(Debug)]
 pub enum DatabaseError {
@@ -166,7 +185,8 @@ impl Database {
         let connection = self.connect().await?;
         connection.query("PRAGMA journal_mode=WAL", ()).await?;
         connection.execute_batch(MIGRATION_TABLE_SQL).await?;
-        run_incremental_migrations(&connection).await
+        run_incremental_migrations(&connection).await?;
+        ensure_vector_index(&connection).await
     }
 
     pub fn config_dir() -> std::result::Result<PathBuf, DatabaseError> {
@@ -221,22 +241,71 @@ impl Database {
         branch: &str,
         file_path: &Path,
         file_hash: &str,
+        chunk_count: u32,
     ) -> Result<()> {
         let connection = self.connect().await.map_err(TruesightError::from)?;
         connection
             .execute(
                 r#"
-                INSERT INTO indexed_files (repo_id, branch, file_path, file_hash)
-                VALUES (?1, ?2, ?3, ?4)
+                INSERT INTO indexed_files (repo_id, branch, file_path, file_hash, chunk_count)
+                VALUES (?1, ?2, ?3, ?4, ?5)
                 ON CONFLICT(repo_id, branch, file_path) DO UPDATE SET
                     file_hash = excluded.file_hash,
+                    chunk_count = excluded.chunk_count,
                     indexed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 "#,
-                params![repo_id, branch, path_to_string(file_path), file_hash],
+                params![
+                    repo_id,
+                    branch,
+                    path_to_string(file_path),
+                    file_hash,
+                    i64::from(chunk_count),
+                ],
             )
             .await
             .map_err(DatabaseError::from)?;
         Ok(())
+    }
+
+    pub async fn update_index_status(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        status: IndexStatus,
+        last_seen_commit_sha: Option<&str>,
+        embedding_model: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        let mut metadata = self
+            .get_index_metadata(repo_id, branch)
+            .await?
+            .unwrap_or_else(|| IndexMetadata {
+                repo_id: repo_id.to_string(),
+                branch: branch.to_string(),
+                status: IndexStatus::Ready,
+                last_indexed_at: Utc::now(),
+                last_commit_sha: None,
+                last_seen_commit_sha: None,
+                file_count: 0,
+                symbol_count: 0,
+                embedding_model: String::new(),
+                last_error: None,
+            });
+
+        metadata.status = status;
+        metadata.last_seen_commit_sha = last_seen_commit_sha.map(ToOwned::to_owned);
+        metadata.last_error = last_error.map(ToOwned::to_owned);
+
+        if let Some(model) = embedding_model {
+            metadata.embedding_model = model.to_string();
+        }
+
+        if status == IndexStatus::Ready {
+            metadata.last_indexed_at = Utc::now();
+            metadata.last_error = None;
+        }
+
+        self.set_index_metadata(repo_id, branch, &metadata).await
     }
 
     pub async fn replace_branch_index(
@@ -285,17 +354,19 @@ impl Database {
             transaction
                 .execute(
                     r#"
-                    INSERT INTO indexed_files (repo_id, branch, file_path, file_hash)
-                    VALUES (?1, ?2, ?3, ?4)
+                    INSERT INTO indexed_files (repo_id, branch, file_path, file_hash, chunk_count)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
                     ON CONFLICT(repo_id, branch, file_path) DO UPDATE SET
                         file_hash = excluded.file_hash,
+                        chunk_count = excluded.chunk_count,
                         indexed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     "#,
                     params![
                         repo_id,
                         branch,
                         path_to_string(&file.file_path),
-                        file.file_hash.clone()
+                        file.file_hash.clone(),
+                        i64::from(file.chunk_count),
                     ],
                 )
                 .await
@@ -308,25 +379,37 @@ impl Database {
                 INSERT INTO index_metadata (
                     repo_id,
                     branch,
+                    status,
                     last_indexed_at,
                     last_commit_sha,
+                    last_seen_commit_sha,
                     file_count,
-                    symbol_count
+                    symbol_count,
+                    embedding_model,
+                    last_error
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ON CONFLICT(repo_id, branch) DO UPDATE SET
+                    status = excluded.status,
                     last_indexed_at = excluded.last_indexed_at,
                     last_commit_sha = excluded.last_commit_sha,
+                    last_seen_commit_sha = excluded.last_seen_commit_sha,
                     file_count = excluded.file_count,
-                    symbol_count = excluded.symbol_count
+                    symbol_count = excluded.symbol_count,
+                    embedding_model = excluded.embedding_model,
+                    last_error = excluded.last_error
                 "#,
                 params![
                     repo_id,
                     branch,
+                    metadata.status.to_string(),
                     metadata.last_indexed_at.to_rfc3339(),
                     metadata.last_commit_sha.clone(),
+                    metadata.last_seen_commit_sha.clone(),
                     i64::from(metadata.file_count),
                     i64::from(metadata.symbol_count),
+                    metadata.embedding_model.clone(),
+                    metadata.last_error.clone(),
                 ],
             )
             .await
@@ -345,7 +428,7 @@ impl Database {
         let mut rows = connection
             .query(
                 r#"
-                SELECT file_path, file_hash, indexed_at
+                SELECT file_path, file_hash, chunk_count, indexed_at
                 FROM indexed_files
                 WHERE repo_id = ?1 AND branch = ?2
                 ORDER BY file_path
@@ -360,11 +443,107 @@ impl Database {
             files.push(IndexedFileRecord {
                 file_path: PathBuf::from(row.get::<String>(0).map_err(DatabaseError::from)?),
                 file_hash: row.get::<String>(1).map_err(DatabaseError::from)?,
-                indexed_at: parse_timestamp(&row.get::<String>(2).map_err(DatabaseError::from)?)?,
+                chunk_count: row.get::<i64>(2).map_err(DatabaseError::from)? as u32,
+                indexed_at: parse_timestamp(&row.get::<String>(3).map_err(DatabaseError::from)?)?,
             });
         }
 
         Ok(files)
+    }
+
+    pub async fn has_indexed_symbols(&self, repo_id: &str, branch: &str) -> Result<bool> {
+        let connection = self.connect().await.map_err(TruesightError::from)?;
+        let mut rows = connection
+            .query(
+                r#"
+                SELECT 1
+                FROM code_units
+                WHERE repo_id = ?1 AND branch = ?2
+                LIMIT 1
+                "#,
+                params![repo_id, branch],
+            )
+            .await
+            .map_err(DatabaseError::from)?;
+        Ok(rows.next().await.map_err(DatabaseError::from)?.is_some())
+    }
+
+    pub async fn list_pending_embeddings(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        embedding_model: &str,
+        limit: usize,
+    ) -> Result<Vec<PendingEmbedding>> {
+        let connection = self.connect().await.map_err(TruesightError::from)?;
+        let mut rows = connection
+            .query(
+                r#"
+                SELECT id, signature, doc, content
+                FROM code_units
+                WHERE repo_id = ?1
+                  AND branch = ?2
+                  AND (embedding IS NULL OR embedding_model != ?3)
+                ORDER BY file_path ASC, line_start ASC, name ASC
+                LIMIT ?4
+                "#,
+                params![repo_id, branch, embedding_model, limit as i64],
+            )
+            .await
+            .map_err(DatabaseError::from)?;
+        let mut pending = Vec::new();
+
+        while let Some(row) = rows.next().await.map_err(DatabaseError::from)? {
+            pending.push(PendingEmbedding {
+                id: row.get::<String>(0).map_err(DatabaseError::from)?,
+                signature: row.get::<String>(1).map_err(DatabaseError::from)?,
+                doc: row.get::<Option<String>>(2).map_err(DatabaseError::from)?,
+                content: row.get::<String>(3).map_err(DatabaseError::from)?,
+            });
+        }
+
+        Ok(pending)
+    }
+
+    pub async fn update_embeddings(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        embedding_model: &str,
+        updates: &[EmbeddingUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let connection = self.connect().await.map_err(TruesightError::from)?;
+        let transaction = connection
+            .transaction()
+            .await
+            .map_err(DatabaseError::from)?;
+
+        for update in updates {
+            transaction
+                .execute(
+                    r#"
+                    UPDATE code_units
+                    SET embedding = ?1, embedding_model = ?2
+                    WHERE repo_id = ?3 AND branch = ?4 AND id = ?5
+                    "#,
+                    params![
+                        encode_embedding(&update.embedding)?,
+                        embedding_model,
+                        repo_id,
+                        branch,
+                        update.id.clone(),
+                    ],
+                )
+                .await
+                .map_err(DatabaseError::from)?;
+        }
+
+        transaction.commit().await.map_err(DatabaseError::from)?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -523,6 +702,155 @@ impl Database {
         results.truncate(limit);
         Ok(results)
     }
+
+    async fn try_search_hybrid_sql(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        sanitized_query: &str,
+        embedding: &[f32],
+        limit: usize,
+        rrf_k: u32,
+    ) -> std::result::Result<Vec<RankedResult>, DatabaseError> {
+        let query_blob = encode_embedding(embedding)?;
+        let candidate_limit = hybrid_candidate_limit(limit);
+        let connection = self.connect().await?;
+        let mut rows = connection
+            .query(
+                r#"
+                WITH
+                fts_source AS (
+                    SELECT
+                        code_units._rowid AS rowid,
+                        bm25(code_units_fts, 6.0, 3.0, 2.0, 1.0) AS score
+                    FROM code_units_fts
+                    JOIN code_units ON code_units._rowid = code_units_fts.rowid
+                    WHERE code_units.repo_id = ?1
+                      AND code_units.branch = ?2
+                      AND code_units_fts MATCH ?3
+                    ORDER BY score ASC, code_units._rowid ASC
+                    LIMIT ?5
+                ),
+                fts_hits AS (
+                    SELECT
+                        rowid,
+                        ROW_NUMBER() OVER (ORDER BY score ASC, rowid ASC) AS rank
+                    FROM fts_source
+                ),
+                vector_source AS (
+                    SELECT
+                        code_units._rowid AS rowid,
+                        v.distance AS distance
+                    FROM vector_top_k('idx_code_units_embedding', vector(?4), ?5) AS v
+                    JOIN code_units ON code_units._rowid = v.id
+                    WHERE code_units.repo_id = ?1
+                      AND code_units.branch = ?2
+                    ORDER BY v.distance ASC, code_units._rowid ASC
+                ),
+                vector_hits AS (
+                    SELECT
+                        rowid,
+                        ROW_NUMBER() OVER (ORDER BY distance ASC, rowid ASC) AS rank
+                    FROM vector_source
+                ),
+                unioned AS (
+                    SELECT rowid, rank, 1 AS saw_fts, 0 AS saw_vector
+                    FROM fts_hits
+                    UNION ALL
+                    SELECT rowid, rank, 0 AS saw_fts, 1 AS saw_vector
+                    FROM vector_hits
+                ),
+                fused AS (
+                    SELECT
+                        rowid,
+                        SUM(CASE WHEN saw_fts = 1 THEN 1.0 / (?6 + rank) ELSE 0.0 END) AS fts_score,
+                        SUM(CASE WHEN saw_vector = 1 THEN 1.0 / (?6 + rank) ELSE 0.0 END) AS vector_score,
+                        SUM(1.0 / (?6 + rank)) AS combined_score,
+                        MAX(saw_fts) AS saw_fts,
+                        MAX(saw_vector) AS saw_vector
+                    FROM unioned
+                    GROUP BY rowid
+                )
+                SELECT
+                    code_units.name,
+                    code_units.kind,
+                    code_units.signature,
+                    code_units.doc,
+                    code_units.file_path,
+                    code_units.line_start,
+                    code_units.line_end,
+                    code_units.content,
+                    code_units.parent,
+                    code_units.language,
+                    CASE WHEN fused.saw_fts = 1 THEN fused.fts_score ELSE NULL END,
+                    CASE WHEN fused.saw_vector = 1 THEN fused.vector_score ELSE NULL END,
+                    fused.combined_score,
+                    CASE
+                        WHEN fused.saw_fts = 1 AND fused.saw_vector = 1 THEN 'hybrid'
+                        WHEN fused.saw_fts = 1 THEN 'fts'
+                        ELSE 'vector'
+                    END AS match_type
+                FROM fused
+                JOIN code_units ON code_units._rowid = fused.rowid
+                ORDER BY
+                    fused.combined_score DESC,
+                    CASE WHEN fused.saw_fts = 1 AND fused.saw_vector = 1 THEN 2 ELSE 1 END DESC,
+                    code_units.line_start ASC,
+                    code_units.file_path ASC,
+                    code_units.name ASC
+                LIMIT ?7
+                "#,
+                params![
+                    repo_id,
+                    branch,
+                    sanitized_query,
+                    query_blob,
+                    candidate_limit as i64,
+                    rrf_k.max(1) as f64,
+                    limit as i64,
+                ],
+            )
+            .await?;
+        let mut results = Vec::new();
+
+        while let Some(row) = rows.next().await? {
+            results.push(ranked_result_from_row(&row, 10, 11, 12, 13)?);
+        }
+
+        Ok(results)
+    }
+
+    async fn search_hybrid_fallback(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        query: &str,
+        embedding: &[f32],
+        limit: usize,
+        rrf_k: u32,
+    ) -> Result<Vec<RankedResult>> {
+        let candidate_limit = hybrid_candidate_limit(limit);
+        let fts_results = self
+            .search_fts(repo_id, branch, query, candidate_limit)
+            .await?;
+        let vector_results = self
+            .search_vector(repo_id, branch, embedding, candidate_limit)
+            .await
+            .unwrap_or_else(|error| {
+                warn!(
+                    repo_id,
+                    branch, query, "vector search unavailable during DB hybrid fallback: {error}"
+                );
+                Vec::new()
+            });
+
+        Ok(fuse_ranked_results(
+            fts_results,
+            vector_results,
+            rrf_k,
+            limit,
+        ))
+    }
 }
 
 #[async_trait]
@@ -573,7 +901,7 @@ impl Storage for Database {
                     code_units.content,
                     code_units.parent,
                     code_units.language,
-                    bm25(code_units_fts) AS score
+                    bm25(code_units_fts, 6.0, 3.0, 2.0, 1.0) AS score
                 FROM code_units_fts
                 JOIN code_units ON code_units._rowid = code_units_fts.rowid
                 WHERE code_units.repo_id = ?1
@@ -601,6 +929,41 @@ impl Storage for Database {
         }
 
         Ok(results)
+    }
+
+    async fn search_hybrid(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        query: &str,
+        embedding: &[f32],
+        limit: usize,
+        rrf_k: u32,
+    ) -> Result<Vec<RankedResult>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let sanitized = match sanitize_fts_query(query) {
+            Some(query) => query,
+            None => return self.search_vector(repo_id, branch, embedding, limit).await,
+        };
+        match self
+            .try_search_hybrid_sql(repo_id, branch, &sanitized, embedding, limit, rrf_k)
+            .await
+        {
+            Ok(results) => Ok(results),
+            Err(error) => {
+                warn!(
+                    repo_id,
+                    branch,
+                    query,
+                    "DB-native hybrid search unavailable; using DB fallback fusion: {error}"
+                );
+                self.search_hybrid_fallback(repo_id, branch, query, embedding, limit, rrf_k)
+                    .await
+            }
+        }
     }
 
     async fn search_vector(
@@ -639,7 +1002,17 @@ impl Storage for Database {
         let mut rows = connection
             .query(
                 r#"
-                SELECT repo_id, branch, last_indexed_at, last_commit_sha, file_count, symbol_count
+                SELECT
+                    repo_id,
+                    branch,
+                    status,
+                    last_indexed_at,
+                    last_commit_sha,
+                    last_seen_commit_sha,
+                    file_count,
+                    symbol_count,
+                    embedding_model,
+                    last_error
                 FROM index_metadata
                 WHERE repo_id = ?1 AND branch = ?2
                 "#,
@@ -652,16 +1025,28 @@ impl Storage for Database {
             return Ok(Some(IndexMetadata {
                 repo_id: row.get::<String>(0).map_err(DatabaseError::from)?,
                 branch: row.get::<String>(1).map_err(DatabaseError::from)?,
+                status: row
+                    .get::<String>(2)
+                    .map_err(DatabaseError::from)?
+                    .parse()
+                    .map_err(DatabaseError::InvalidEnumValue)?,
                 last_indexed_at: parse_timestamp(
-                    &row.get::<String>(2).map_err(DatabaseError::from)?,
+                    &row.get::<String>(3).map_err(DatabaseError::from)?,
                 )?,
-                last_commit_sha: row.get::<Option<String>>(3).map_err(DatabaseError::from)?,
-                file_count: row.get::<i64>(4).map_err(DatabaseError::from)? as u32,
-                symbol_count: row.get::<i64>(5).map_err(DatabaseError::from)? as u32,
+                last_commit_sha: row.get::<Option<String>>(4).map_err(DatabaseError::from)?,
+                last_seen_commit_sha: row.get::<Option<String>>(5).map_err(DatabaseError::from)?,
+                file_count: row.get::<i64>(6).map_err(DatabaseError::from)? as u32,
+                symbol_count: row.get::<i64>(7).map_err(DatabaseError::from)? as u32,
+                embedding_model: row.get::<String>(8).map_err(DatabaseError::from)?,
+                last_error: row.get::<Option<String>>(9).map_err(DatabaseError::from)?,
             }));
         }
 
         Ok(None)
+    }
+
+    async fn has_indexed_symbols(&self, repo_id: &str, branch: &str) -> Result<bool> {
+        Database::has_indexed_symbols(self, repo_id, branch).await
     }
 
     async fn set_index_metadata(
@@ -677,25 +1062,37 @@ impl Storage for Database {
                 INSERT INTO index_metadata (
                     repo_id,
                     branch,
+                    status,
                     last_indexed_at,
                     last_commit_sha,
+                    last_seen_commit_sha,
                     file_count,
-                    symbol_count
+                    symbol_count,
+                    embedding_model,
+                    last_error
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ON CONFLICT(repo_id, branch) DO UPDATE SET
+                    status = excluded.status,
                     last_indexed_at = excluded.last_indexed_at,
                     last_commit_sha = excluded.last_commit_sha,
+                    last_seen_commit_sha = excluded.last_seen_commit_sha,
                     file_count = excluded.file_count,
-                    symbol_count = excluded.symbol_count
+                    symbol_count = excluded.symbol_count,
+                    embedding_model = excluded.embedding_model,
+                    last_error = excluded.last_error
                 "#,
                 params![
                     repo_id,
                     branch,
+                    meta.status.to_string(),
                     meta.last_indexed_at.to_rfc3339(),
                     meta.last_commit_sha.clone(),
+                    meta.last_seen_commit_sha.clone(),
                     i64::from(meta.file_count),
                     i64::from(meta.symbol_count),
+                    meta.embedding_model.clone(),
+                    meta.last_error.clone(),
                 ],
             )
             .await
@@ -775,8 +1172,30 @@ impl IndexStorage for Database {
         branch: &str,
         file_path: &Path,
         file_hash: &str,
+        chunk_count: u32,
     ) -> Result<()> {
-        Database::upsert_indexed_file(self, repo_id, branch, file_path, file_hash).await
+        Database::upsert_indexed_file(self, repo_id, branch, file_path, file_hash, chunk_count)
+            .await
+    }
+
+    async fn list_pending_embeddings(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        embedding_model: &str,
+        limit: usize,
+    ) -> Result<Vec<PendingEmbedding>> {
+        Database::list_pending_embeddings(self, repo_id, branch, embedding_model, limit).await
+    }
+
+    async fn update_embeddings(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        embedding_model: &str,
+        updates: &[EmbeddingUpdate],
+    ) -> Result<()> {
+        Database::update_embeddings(self, repo_id, branch, embedding_model, updates).await
     }
 
     async fn replace_branch_index(
@@ -855,6 +1274,22 @@ async fn run_incremental_migrations(
     }
 
     Ok(())
+}
+
+async fn ensure_vector_index(connection: &Connection) -> std::result::Result<(), DatabaseError> {
+    match connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_code_units_embedding ON code_units(libsql_vector_idx(embedding))",
+            (),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            warn!(error = %error, "vector index unavailable; semantic search will use fallback path");
+            Ok(())
+        }
+    }
 }
 
 fn normalize_repo_root(repo_root: &Path) -> std::result::Result<PathBuf, DatabaseError> {
@@ -939,9 +1374,9 @@ const UPSERT_CODE_UNIT_SQL: &str = r#"
     INSERT INTO code_units (
         id, repo_id, branch, file_path, name, kind, signature,
         doc, content, parent, language, line_start, line_end,
-        embedding, file_hash
+        embedding, embedding_model, file_hash
     )
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
     ON CONFLICT(repo_id, branch, file_path, name, kind, line_start) DO UPDATE SET
         id = excluded.id,
         signature = excluded.signature,
@@ -950,7 +1385,22 @@ const UPSERT_CODE_UNIT_SQL: &str = r#"
         parent = excluded.parent,
         language = excluded.language,
         line_end = excluded.line_end,
-        embedding = excluded.embedding,
+        embedding = CASE
+            WHEN code_units.signature != excluded.signature
+              OR ifnull(code_units.doc, '') != ifnull(excluded.doc, '')
+              OR code_units.content != excluded.content
+            THEN NULL
+            WHEN excluded.embedding IS NOT NULL THEN excluded.embedding
+            ELSE code_units.embedding
+        END,
+        embedding_model = CASE
+            WHEN code_units.signature != excluded.signature
+              OR ifnull(code_units.doc, '') != ifnull(excluded.doc, '')
+              OR code_units.content != excluded.content
+            THEN ''
+            WHEN excluded.embedding_model != '' THEN excluded.embedding_model
+            ELSE code_units.embedding_model
+        END,
         file_hash = excluded.file_hash
 "#;
 
@@ -988,6 +1438,11 @@ async fn insert_code_unit(
             i64::from(entry.unit.line_start),
             i64::from(entry.unit.line_end),
             embedding_blob,
+            if entry.embedding.is_some() {
+                "unknown"
+            } else {
+                ""
+            },
             file_hash,
         ],
     )
@@ -1019,6 +1474,145 @@ fn code_unit_from_row(row: &libsql::Row, offset: i32) -> Result<CodeUnit> {
             .parse()
             .map_err(|err: String| DatabaseError::InvalidEnumValue(err))?,
     })
+}
+
+fn ranked_result_from_row(
+    row: &libsql::Row,
+    fts_score_offset: i32,
+    vector_score_offset: i32,
+    combined_score_offset: i32,
+    match_type_offset: i32,
+) -> std::result::Result<RankedResult, DatabaseError> {
+    let match_type = row
+        .get::<String>(match_type_offset)
+        .map_err(DatabaseError::from)?
+        .parse()
+        .map_err(DatabaseError::InvalidEnumValue)?;
+
+    Ok(RankedResult {
+        unit: code_unit_from_row(row, 0)
+            .map_err(|error| DatabaseError::InvalidEmbedding(error.to_string()))?,
+        fts_score: row
+            .get::<Option<f64>>(fts_score_offset)
+            .map_err(DatabaseError::from)?
+            .map(|score| score as f32),
+        vector_score: row
+            .get::<Option<f64>>(vector_score_offset)
+            .map_err(DatabaseError::from)?
+            .map(|score| score as f32),
+        combined_score: row
+            .get::<f64>(combined_score_offset)
+            .map_err(DatabaseError::from)? as f32,
+        match_type,
+    })
+}
+
+fn fuse_ranked_results(
+    fts_results: Vec<RankedResult>,
+    vector_results: Vec<RankedResult>,
+    rrf_k: u32,
+    limit: usize,
+) -> Vec<RankedResult> {
+    let mut fused: HashMap<String, FusedResult> = HashMap::new();
+    let rrf_k = rrf_k.max(1) as f32;
+
+    accumulate_rrf(&mut fused, fts_results, rrf_k, MatchType::Fts);
+    accumulate_rrf(&mut fused, vector_results, rrf_k, MatchType::Vector);
+
+    let mut results = fused
+        .into_values()
+        .map(|result| RankedResult {
+            unit: result.unit,
+            fts_score: if result.saw_fts {
+                Some(result.fts_score)
+            } else {
+                None
+            },
+            vector_score: if result.saw_vector {
+                Some(result.vector_score)
+            } else {
+                None
+            },
+            combined_score: result.rrf_score,
+            match_type: result.match_type,
+        })
+        .collect::<Vec<_>>();
+
+    results.sort_by(compare_ranked_results);
+    results.truncate(limit);
+    results
+}
+
+fn accumulate_rrf(
+    fused: &mut HashMap<String, FusedResult>,
+    results: Vec<RankedResult>,
+    rrf_k: f32,
+    source: MatchType,
+) {
+    for (index, result) in results.into_iter().enumerate() {
+        let key = ranked_result_key(&result.unit);
+        let rank = (index + 1) as f32;
+        let contribution = 1.0 / (rrf_k + rank);
+
+        let entry = fused.entry(key).or_insert_with(|| FusedResult {
+            unit: result.unit.clone(),
+            rrf_score: 0.0,
+            fts_score: 0.0,
+            vector_score: 0.0,
+            saw_fts: false,
+            saw_vector: false,
+            match_type: source,
+        });
+
+        entry.rrf_score += contribution;
+
+        match source {
+            MatchType::Fts => {
+                entry.saw_fts = true;
+                entry.fts_score += contribution;
+            }
+            MatchType::Vector => {
+                entry.saw_vector = true;
+                entry.vector_score += contribution;
+            }
+            MatchType::Hybrid => {}
+        }
+
+        entry.match_type = match (entry.saw_fts, entry.saw_vector) {
+            (true, true) => MatchType::Hybrid,
+            (true, false) => MatchType::Fts,
+            (false, true) => MatchType::Vector,
+            (false, false) => source,
+        };
+    }
+}
+
+fn compare_ranked_results(left: &RankedResult, right: &RankedResult) -> Ordering {
+    right
+        .combined_score
+        .partial_cmp(&left.combined_score)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| match_type_rank(right.match_type).cmp(&match_type_rank(left.match_type)))
+        .then_with(|| left.unit.line_start.cmp(&right.unit.line_start))
+        .then_with(|| left.unit.file_path.cmp(&right.unit.file_path))
+        .then_with(|| left.unit.name.cmp(&right.unit.name))
+}
+
+fn match_type_rank(match_type: MatchType) -> u8 {
+    match match_type {
+        MatchType::Hybrid => 2,
+        MatchType::Fts | MatchType::Vector => 1,
+    }
+}
+
+fn ranked_result_key(unit: &CodeUnit) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
+        unit.file_path.display(),
+        unit.name,
+        unit.kind,
+        unit.line_start,
+    )
 }
 
 fn encode_embedding(embedding: &[f32]) -> std::result::Result<Vec<u8>, DatabaseError> {
@@ -1107,6 +1701,21 @@ fn normalize_fts_score(raw_score: f32) -> f32 {
     1.0 / (1.0 + magnitude)
 }
 
+fn hybrid_candidate_limit(limit: usize) -> usize {
+    limit.max(1).saturating_mul(3)
+}
+
+#[derive(Clone)]
+struct FusedResult {
+    unit: CodeUnit,
+    rrf_score: f32,
+    fts_score: f32,
+    vector_score: f32,
+    saw_fts: bool,
+    saw_vector: bool,
+    match_type: MatchType,
+}
+
 fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
@@ -1128,7 +1737,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use truesight_core::{
-        CodeUnit, CodeUnitKind, IndexMetadata, IndexedCodeUnit, Language, MatchType, Storage,
+        CodeUnit, CodeUnitKind, IndexMetadata, IndexStatus, IndexedCodeUnit, Language, MatchType,
+        Storage,
     };
 
     const REPO_ID: &str = "/repo";
@@ -1190,6 +1800,26 @@ mod tests {
         }
     }
 
+    fn sample_metadata(
+        branch: &str,
+        last_commit_sha: Option<&str>,
+        file_count: u32,
+        symbol_count: u32,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            repo_id: REPO_ID.to_string(),
+            branch: branch.to_string(),
+            status: IndexStatus::Ready,
+            last_indexed_at: Utc::now(),
+            last_commit_sha: last_commit_sha.map(ToOwned::to_owned),
+            last_seen_commit_sha: last_commit_sha.map(ToOwned::to_owned),
+            file_count,
+            symbol_count,
+            embedding_model: "all-MiniLM-L6-v2".to_string(),
+            last_error: None,
+        }
+    }
+
     async fn stored_embedding_blob(database: &Database, name: &str) -> Vec<u8> {
         let connection = database.connect().await.unwrap();
         let mut rows = connection
@@ -1229,7 +1859,13 @@ mod tests {
         assert!(triggers.contains(&String::from("code_units_fts_update")));
 
         let migrations = migration_rows(&database).await;
-        assert_eq!(migrations, vec![(1, String::from("initial_schema"))]);
+        assert_eq!(
+            migrations,
+            vec![
+                (1, String::from("initial_schema")),
+                (2, String::from("add_index_state_and_embedding_metadata")),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1239,7 +1875,13 @@ mod tests {
         database.run_migrations().await.unwrap();
 
         let migrations = migration_rows(&database).await;
-        assert_eq!(migrations, vec![(1, String::from("initial_schema"))]);
+        assert_eq!(
+            migrations,
+            vec![
+                (1, String::from("initial_schema")),
+                (2, String::from("add_index_state_and_embedding_metadata")),
+            ]
+        );
 
         let connection = database.connect().await.unwrap();
         let mut rows = connection
@@ -1371,6 +2013,37 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_fts_weights_name_and_signature_above_content_only_matches() {
+        let (_temp_dir, database) = open_temp_database().await;
+        let content_only = sample_unit(
+            "helper",
+            "src/helper.rs",
+            10,
+            "pub fn helper() -> bool { let note = \"token_refresh token_refresh\"; true }",
+        );
+        let exact_symbol = sample_unit(
+            "token_refresh",
+            "src/token.rs",
+            20,
+            "pub fn token_refresh() -> bool { true }",
+        );
+
+        database
+            .store_code_units(REPO_ID, BRANCH, &[content_only, exact_symbol])
+            .await
+            .unwrap();
+
+        let results = database
+            .search_fts(REPO_ID, BRANCH, "token_refresh", 2)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].unit.name, "token_refresh");
+        assert_eq!(results[1].unit.name, "helper");
     }
 
     #[test]
@@ -1519,6 +2192,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_hybrid_fuses_lexical_and_vector_hits() {
+        let (_temp_dir, database) = open_temp_database().await;
+        let hybrid = IndexedCodeUnit {
+            unit: sample_unit(
+                "authenticate_user",
+                "src/auth.rs",
+                10,
+                "pub fn authenticate_user() -> bool { true }",
+            ),
+            embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
+            file_hash: None,
+        };
+        let lexical_only = IndexedCodeUnit {
+            unit: sample_unit(
+                "user_validator",
+                "src/user.rs",
+                20,
+                "pub fn user_validator() -> bool { let label = \"authenticate user\"; true }",
+            ),
+            embedding: Some(vec![0.0, 1.0, 0.0, 0.0]),
+            file_hash: None,
+        };
+        let vector_only = IndexedCodeUnit {
+            unit: sample_unit(
+                "semantic_auth",
+                "src/semantic.rs",
+                30,
+                "pub fn semantic_auth() -> bool { false }",
+            ),
+            embedding: Some(vec![0.95, 0.05, 0.0, 0.0]),
+            file_hash: None,
+        };
+
+        database
+            .store_indexed_units(REPO_ID, BRANCH, &[hybrid, lexical_only, vector_only])
+            .await
+            .unwrap();
+
+        let results = database
+            .search_hybrid(
+                REPO_ID,
+                BRANCH,
+                "authenticate user",
+                &[1.0, 0.0, 0.0, 0.0],
+                3,
+                60,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].unit.name, "authenticate_user");
+        assert_eq!(results[0].match_type, MatchType::Hybrid);
+        assert!(
+            results
+                .iter()
+                .any(|result| result.match_type == MatchType::Vector)
+        );
+        assert!(results[0].combined_score > results[1].combined_score);
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_uses_vector_results_when_query_has_no_fts_tokens() {
+        let (_temp_dir, database) = open_temp_database().await;
+        let target = IndexedCodeUnit {
+            unit: sample_unit(
+                "semantic_auth",
+                "src/semantic.rs",
+                10,
+                "pub fn semantic_auth() -> bool { true }",
+            ),
+            embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
+            file_hash: None,
+        };
+
+        database
+            .store_indexed_units(REPO_ID, BRANCH, &[target])
+            .await
+            .unwrap();
+
+        let results = database
+            .search_hybrid(REPO_ID, BRANCH, "   ", &[1.0, 0.0, 0.0, 0.0], 1, 60)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].unit.name, "semantic_auth");
+        assert_eq!(results[0].match_type, MatchType::Vector);
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_fallback_tracks_source_specific_rrf_scores() {
+        let (_temp_dir, database) = open_temp_database().await;
+        let hybrid = IndexedCodeUnit {
+            unit: sample_unit(
+                "authenticate_user",
+                "src/auth.rs",
+                10,
+                "pub fn authenticate_user() -> bool { true }",
+            ),
+            embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
+            file_hash: None,
+        };
+        let vector_only = IndexedCodeUnit {
+            unit: sample_unit(
+                "semantic_auth",
+                "src/semantic.rs",
+                30,
+                "pub fn semantic_auth() -> bool { false }",
+            ),
+            embedding: Some(vec![0.95, 0.05, 0.0, 0.0]),
+            file_hash: None,
+        };
+
+        database
+            .store_indexed_units(REPO_ID, BRANCH, &[hybrid, vector_only])
+            .await
+            .unwrap();
+
+        let results = database
+            .search_hybrid_fallback(
+                REPO_ID,
+                BRANCH,
+                "authenticate user",
+                &[1.0, 0.0, 0.0, 0.0],
+                2,
+                60,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].unit.name, "authenticate_user");
+        assert_eq!(results[0].match_type, MatchType::Hybrid);
+        assert!(results[0].fts_score.unwrap() > 0.0);
+        assert!(results[0].vector_score.unwrap() > 0.0);
+        assert!(results[0].combined_score > results[0].fts_score.unwrap());
+        assert!(results[0].combined_score > results[0].vector_score.unwrap());
+    }
+
+    #[tokio::test]
     async fn delete_units_for_file_removes_only_requested_file() {
         let (_temp_dir, database) = open_temp_database().await;
         let alpha = sample_unit(
@@ -1558,14 +2372,7 @@ mod tests {
     #[tokio::test]
     async fn index_metadata_round_trips() {
         let (_temp_dir, database) = open_temp_database().await;
-        let metadata = IndexMetadata {
-            repo_id: REPO_ID.to_string(),
-            branch: BRANCH.to_string(),
-            last_indexed_at: Utc::now(),
-            last_commit_sha: Some("abc123".to_string()),
-            file_count: 7,
-            symbol_count: 21,
-        };
+        let metadata = sample_metadata(BRANCH, Some("abc123"), 7, 21);
 
         database
             .set_index_metadata(REPO_ID, BRANCH, &metadata)
@@ -1594,26 +2401,15 @@ mod tests {
     async fn indexed_files_round_trip_and_branch_delete_cleans_related_rows() {
         let (_temp_dir, database) = open_temp_database().await;
         database
-            .upsert_indexed_file(REPO_ID, BRANCH, Path::new("src/alpha.rs"), "hash-alpha")
+            .upsert_indexed_file(REPO_ID, BRANCH, Path::new("src/alpha.rs"), "hash-alpha", 1)
             .await
             .unwrap();
         database
-            .upsert_indexed_file(REPO_ID, BRANCH, Path::new("src/beta.rs"), "hash-beta")
+            .upsert_indexed_file(REPO_ID, BRANCH, Path::new("src/beta.rs"), "hash-beta", 2)
             .await
             .unwrap();
         database
-            .set_index_metadata(
-                REPO_ID,
-                BRANCH,
-                &IndexMetadata {
-                    repo_id: REPO_ID.to_string(),
-                    branch: BRANCH.to_string(),
-                    last_indexed_at: Utc::now(),
-                    last_commit_sha: None,
-                    file_count: 2,
-                    symbol_count: 3,
-                },
-            )
+            .set_index_metadata(REPO_ID, BRANCH, &sample_metadata(BRANCH, None, 2, 3))
             .await
             .unwrap();
         database
@@ -1667,18 +2463,7 @@ mod tests {
 
         for branch in ["feature/auth", "main", "feature/auth", "detached-deadbeef"] {
             database
-                .set_index_metadata(
-                    REPO_ID,
-                    branch,
-                    &IndexMetadata {
-                        repo_id: REPO_ID.to_string(),
-                        branch: branch.to_string(),
-                        last_indexed_at: Utc::now(),
-                        last_commit_sha: None,
-                        file_count: 0,
-                        symbol_count: 0,
-                    },
-                )
+                .set_index_metadata(REPO_ID, branch, &sample_metadata(branch, None, 0, 0))
                 .await
                 .unwrap();
         }
@@ -1723,14 +2508,7 @@ mod tests {
             .set_index_metadata(
                 REPO_ID,
                 "main",
-                &IndexMetadata {
-                    repo_id: REPO_ID.to_string(),
-                    branch: "main".to_string(),
-                    last_indexed_at: Utc::now(),
-                    last_commit_sha: Some("1111111".to_string()),
-                    file_count: 1,
-                    symbol_count: 1,
-                },
+                &sample_metadata("main", Some("1111111"), 1, 1),
             )
             .await
             .unwrap();
@@ -1738,14 +2516,7 @@ mod tests {
             .set_index_metadata(
                 REPO_ID,
                 "feature/auth",
-                &IndexMetadata {
-                    repo_id: REPO_ID.to_string(),
-                    branch: "feature/auth".to_string(),
-                    last_indexed_at: Utc::now(),
-                    last_commit_sha: Some("2222222".to_string()),
-                    file_count: 1,
-                    symbol_count: 1,
-                },
+                &sample_metadata("feature/auth", Some("2222222"), 1, 1),
             )
             .await
             .unwrap();
@@ -1828,7 +2599,7 @@ mod tests {
             .await
             .unwrap();
         database
-            .upsert_indexed_file(REPO_ID, "main", Path::new("src/lib.rs"), "hash-main")
+            .upsert_indexed_file(REPO_ID, "main", Path::new("src/lib.rs"), "hash-main", 1)
             .await
             .unwrap();
         database
@@ -1837,36 +2608,19 @@ mod tests {
                 "feature/auth",
                 Path::new("src/lib.rs"),
                 "hash-feature",
+                1,
             )
             .await
             .unwrap();
         database
-            .set_index_metadata(
-                REPO_ID,
-                "main",
-                &IndexMetadata {
-                    repo_id: REPO_ID.to_string(),
-                    branch: "main".to_string(),
-                    last_indexed_at: Utc::now(),
-                    last_commit_sha: None,
-                    file_count: 1,
-                    symbol_count: 1,
-                },
-            )
+            .set_index_metadata(REPO_ID, "main", &sample_metadata("main", None, 1, 1))
             .await
             .unwrap();
         database
             .set_index_metadata(
                 REPO_ID,
                 "feature/auth",
-                &IndexMetadata {
-                    repo_id: REPO_ID.to_string(),
-                    branch: "feature/auth".to_string(),
-                    last_indexed_at: Utc::now(),
-                    last_commit_sha: None,
-                    file_count: 1,
-                    symbol_count: 1,
-                },
+                &sample_metadata("feature/auth", None, 1, 1),
             )
             .await
             .unwrap();

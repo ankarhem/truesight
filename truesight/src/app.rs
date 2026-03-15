@@ -8,7 +8,7 @@ use std::time::Duration as StdDuration;
 use anyhow::{Context, anyhow};
 use chrono::{Duration, Utc};
 use serde::Serialize;
-use truesight_core::IndexMetadata;
+use truesight_core::{Embedder, IndexMetadata, IndexStatus};
 use truesight_core::{IndexStats, RepoMap, SearchConfig, SearchResult, Storage};
 use truesight_db::Database;
 use truesight_engine::{
@@ -55,35 +55,66 @@ impl AppServices {
         let database = open_database(&repo_root).await?;
         let embedder = OnnxEmbedder::new().context("failed to initialize embedder")?;
 
-        let stats = if full {
-            index_repo(&repo_root, &database, &embedder).await?
-        } else {
-            let indexer = IncrementalIndexer::new();
-            let changes = indexer
-                .detect_changes(&repo_root, &database, &context.repo_id, &context.branch)
-                .await?;
+        database
+            .update_index_status(
+                &context.repo_id,
+                &context.branch,
+                IndexStatus::Indexing,
+                context.last_commit_sha.as_deref(),
+                Some(embedder.model_name()),
+                None,
+            )
+            .await?;
 
-            if change_count(&changes) == 0 {
-                IndexStats {
-                    files_scanned: 0,
-                    files_indexed: 0,
-                    files_skipped: 0,
-                    symbols_extracted: 0,
-                    chunks_embedded: 0,
-                    duration_ms: 0,
-                    languages: HashMap::new(),
-                }
+        let stats_result = async {
+            if full {
+                index_repo(&repo_root, &database, &embedder).await
             } else {
-                indexer
-                    .incremental_index(
-                        &repo_root,
-                        &changes,
-                        &database,
-                        &embedder,
+                let indexer = IncrementalIndexer::new();
+                let changes = indexer
+                    .detect_changes(&repo_root, &database, &context.repo_id, &context.branch)
+                    .await?;
+
+                if change_count(&changes) == 0 {
+                    Ok(IndexStats {
+                        files_scanned: 0,
+                        files_indexed: 0,
+                        files_skipped: 0,
+                        symbols_extracted: 0,
+                        chunks_embedded: 0,
+                        duration_ms: 0,
+                        languages: HashMap::new(),
+                    })
+                } else {
+                    indexer
+                        .incremental_index(
+                            &repo_root,
+                            &changes,
+                            &database,
+                            &embedder,
+                            &context.repo_id,
+                            &context.branch,
+                        )
+                        .await
+                }
+            }
+        }
+        .await;
+
+        let stats = match stats_result {
+            Ok(stats) => stats,
+            Err(error) => {
+                let _ = database
+                    .update_index_status(
                         &context.repo_id,
                         &context.branch,
+                        IndexStatus::Failed,
+                        context.last_commit_sha.as_deref(),
+                        Some(embedder.model_name()),
+                        Some(&error.to_string()),
                     )
-                    .await?
+                    .await;
+                return Err(error.into());
             }
         };
 
@@ -326,9 +357,7 @@ async fn branch_has_index(
     repo_id: &str,
     branch: &str,
 ) -> anyhow::Result<bool> {
-    Ok(!Storage::get_all_symbols(database, repo_id, branch)
-        .await?
-        .is_empty())
+    Ok(Storage::has_indexed_symbols(database, repo_id, branch).await?)
 }
 
 fn write_index_output(
@@ -566,6 +595,10 @@ fn change_count(changes: &truesight_engine::ChangeSet) -> usize {
 }
 
 fn should_refresh_index(metadata: &IndexMetadata, current_commit_sha: Option<&str>) -> bool {
+    if metadata.status != IndexStatus::Ready {
+        return true;
+    }
+
     if Utc::now() - metadata.last_indexed_at < Duration::minutes(STALE_INDEX_MAX_AGE_MINUTES) {
         return false;
     }
@@ -827,10 +860,14 @@ mod tests {
         let metadata = IndexMetadata {
             repo_id: String::from("repo-id"),
             branch: String::from("main"),
+            status: IndexStatus::Ready,
             last_indexed_at: Utc::now() - Duration::minutes(10),
             last_commit_sha: Some(String::from("old")),
+            last_seen_commit_sha: Some(String::from("old")),
             file_count: 1,
             symbol_count: 1,
+            embedding_model: String::from("all-MiniLM-L6-v2"),
+            last_error: None,
         };
 
         assert!(should_refresh_index(&metadata, Some("new")));

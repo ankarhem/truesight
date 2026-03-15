@@ -544,6 +544,10 @@ impl Embedder for OnnxEmbedder {
     fn dimension(&self) -> usize {
         MODEL_DIMENSION
     }
+
+    fn model_name(&self) -> &str {
+        MODEL_NAME
+    }
 }
 
 struct ModelAssets {
