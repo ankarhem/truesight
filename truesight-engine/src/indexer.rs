@@ -204,7 +204,6 @@ struct ProcessedFile {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::{Arc, Mutex};
 
     mod git_fixture {
         include!(concat!(
@@ -213,236 +212,22 @@ mod tests {
         ));
     }
 
-    use async_trait::async_trait;
+    mod storage_fakes {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/test_support/storage_fakes.rs"
+        ));
+    }
+
     use tempfile::TempDir;
     use truesight_core::{
-        EmbeddingUpdate, IndexStatus, IndexStorage, IndexedCodeUnit, IndexedFileRecord,
-        MockIndexStorage, PendingEmbedding, RankedResult, Storage, TruesightError,
+        IndexStatus, IndexStorage, IndexedCodeUnit, IndexedFileRecord, MockIndexStorage,
+        TruesightError,
     };
 
     use super::*;
     use git_fixture::{TempGitFixture, init_empty_git_repo};
-
-    #[derive(Clone, Default)]
-    struct RecordingStorage {
-        state: Arc<Mutex<StorageState>>,
-    }
-
-    #[derive(Default)]
-    struct StorageState {
-        stored_units: Vec<IndexedCodeUnit>,
-        indexed_files: Vec<IndexedFileRecord>,
-        metadata: Option<IndexMetadata>,
-        deleted_branches: Vec<(String, String)>,
-    }
-
-    #[async_trait]
-    impl Storage for RecordingStorage {
-        async fn store_code_units(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            _units: &[CodeUnit],
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        async fn search_fts(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            _query: &str,
-            _limit: usize,
-        ) -> Result<Vec<RankedResult>> {
-            Ok(Vec::new())
-        }
-
-        async fn search_vector(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            _embedding: &[f32],
-            _limit: usize,
-        ) -> Result<Vec<RankedResult>> {
-            Ok(Vec::new())
-        }
-
-        async fn search_hybrid(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            _query: &str,
-            _embedding: &[f32],
-            _limit: usize,
-            _rrf_k: u32,
-        ) -> Result<Vec<RankedResult>> {
-            Ok(Vec::new())
-        }
-
-        async fn get_index_metadata(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-        ) -> Result<Option<IndexMetadata>> {
-            Ok(self
-                .state
-                .lock()
-                .expect("storage lock poisoned")
-                .metadata
-                .clone())
-        }
-
-        async fn set_index_metadata(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            meta: &IndexMetadata,
-        ) -> Result<()> {
-            self.state.lock().expect("storage lock poisoned").metadata = Some(meta.clone());
-            Ok(())
-        }
-
-        async fn has_indexed_symbols(&self, _repo_id: &str, _branch: &str) -> Result<bool> {
-            Ok(!self
-                .state
-                .lock()
-                .expect("storage lock poisoned")
-                .stored_units
-                .is_empty())
-        }
-
-        async fn delete_branch_index(&self, repo_id: &str, branch: &str) -> Result<()> {
-            self.state
-                .lock()
-                .expect("storage lock poisoned")
-                .deleted_branches
-                .push((repo_id.to_string(), branch.to_string()));
-            Ok(())
-        }
-
-        async fn get_all_symbols(&self, _repo_id: &str, _branch: &str) -> Result<Vec<CodeUnit>> {
-            Ok(self
-                .state
-                .lock()
-                .expect("storage lock poisoned")
-                .stored_units
-                .iter()
-                .map(|entry| entry.unit.clone())
-                .collect())
-        }
-    }
-
-    #[async_trait]
-    impl IndexStorage for RecordingStorage {
-        async fn store_indexed_units(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            units: &[IndexedCodeUnit],
-        ) -> Result<()> {
-            self.state
-                .lock()
-                .expect("storage lock poisoned")
-                .stored_units
-                .extend(units.iter().cloned());
-            Ok(())
-        }
-
-        async fn upsert_indexed_file(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            file_path: &Path,
-            file_hash: &str,
-            chunk_count: u32,
-        ) -> Result<()> {
-            self.state
-                .lock()
-                .expect("storage lock poisoned")
-                .indexed_files
-                .push(IndexedFileRecord {
-                    file_path: file_path.to_path_buf(),
-                    file_hash: file_hash.to_string(),
-                    chunk_count,
-                    indexed_at: Utc::now(),
-                });
-            Ok(())
-        }
-
-        async fn list_pending_embeddings(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            _embedding_model: &str,
-            limit: usize,
-        ) -> Result<Vec<PendingEmbedding>> {
-            Ok(self
-                .state
-                .lock()
-                .expect("storage lock poisoned")
-                .stored_units
-                .iter()
-                .filter(|entry| entry.embedding.is_none())
-                .take(limit)
-                .map(|entry| PendingEmbedding {
-                    id: pending_id(&entry.unit),
-                    signature: entry.unit.signature.clone(),
-                    doc: entry.unit.doc.clone(),
-                    content: entry.unit.content.clone(),
-                })
-                .collect())
-        }
-
-        async fn update_embeddings(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            _embedding_model: &str,
-            updates: &[EmbeddingUpdate],
-        ) -> Result<()> {
-            let mut state = self.state.lock().expect("storage lock poisoned");
-            for update in updates {
-                if let Some(entry) = state
-                    .stored_units
-                    .iter_mut()
-                    .find(|entry| pending_id(&entry.unit) == update.id)
-                {
-                    entry.embedding = Some(update.embedding.clone());
-                }
-            }
-            Ok(())
-        }
-    }
-
-    struct FakeEmbedder;
-
-    impl Embedder for FakeEmbedder {
-        fn embed(&self, text: &str) -> Result<Vec<f32>> {
-            let length = text.len() as f32;
-            Ok(vec![length, length / 2.0, length / 4.0, 1.0])
-        }
-
-        fn embed_batch<'a>(&self, texts: &[&'a str]) -> Result<Vec<Vec<f32>>> {
-            texts.iter().map(|text| self.embed(text)).collect()
-        }
-
-        fn dimension(&self) -> usize {
-            4
-        }
-
-        fn model_name(&self) -> &str {
-            "fake-model"
-        }
-    }
-
-    fn pending_id(unit: &CodeUnit) -> String {
-        format!(
-            "{}:{}:{}",
-            unit.file_path.display(),
-            unit.name,
-            unit.line_start
-        )
-    }
+    use storage_fakes::{DeterministicFakeEmbedder as FakeEmbedder, RecordingStorage};
 
     struct ControlledParser {
         inner: CodeParser,
