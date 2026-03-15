@@ -1,14 +1,11 @@
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, anyhow};
-use chrono::{Duration, Utc};
 use serde::Serialize;
-use truesight_core::{Embedder, IndexMetadata, IndexStatus};
+use truesight_core::{Embedder, IndexStatus};
 use truesight_core::{IndexStats, RepoMap, SearchConfig, SearchResult, Storage};
 use truesight_db::Database;
 use truesight_engine::{
@@ -17,15 +14,17 @@ use truesight_engine::{
 };
 
 use crate::cli::{Cli, Commands, IndexArgs, RepoMapArgs, SearchArgs};
+mod output;
+mod runtime;
 
-const STALE_INDEX_MAX_AGE_MINUTES: i64 = 5;
-const INDEXING_WAIT_RETRIES: usize = 600;
-const INDEXING_WAIT_INTERVAL_MS: u64 = 100;
-const INDEXING_MARKER_STALE_SECS: u64 = 300;
+use output::{write_index_output, write_repomap_output, write_search_output};
+use runtime::{
+    INDEXING_WAIT_INTERVAL_MS, branch_has_index, canonicalize_repo_root, change_count,
+    lock_repo_operation, open_database, should_refresh_index, should_retry_repo_operation,
+    wait_for_indexing_marker,
+};
+
 const SEARCH_RETRY_ATTEMPTS: usize = 10;
-static REPO_OPERATION_LOCKS: OnceLock<
-    tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
-> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AppServices;
@@ -50,7 +49,7 @@ impl AppServices {
         repo_root: PathBuf,
         full: bool,
     ) -> anyhow::Result<IndexRepoResponse> {
-        let _marker = acquire_indexing_marker(&repo_root).await?;
+        let _marker = runtime::acquire_indexing_marker(&repo_root).await?;
         let context = detect_repo_context(&repo_root)?;
         let database = open_database(&repo_root).await?;
         let embedder = OnnxEmbedder::new().context("failed to initialize embedder")?;
@@ -335,280 +334,6 @@ async fn run_repomap(
     write_repomap_output(writer, &response)
 }
 
-async fn open_database(repo_root: &Path) -> anyhow::Result<Database> {
-    let db_path = Database::db_path_for_repo(repo_root)?;
-    let database = Database::new(&db_path).await?;
-
-    let mut attempts = 0_u8;
-    loop {
-        match database.run_migrations().await {
-            Ok(()) => return Ok(database),
-            Err(error) if error.to_string().contains("database is locked") && attempts < 20 => {
-                attempts += 1;
-                tokio::time::sleep(StdDuration::from_millis(100)).await;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
-async fn branch_has_index(
-    database: &Database,
-    repo_id: &str,
-    branch: &str,
-) -> anyhow::Result<bool> {
-    Ok(Storage::has_indexed_symbols(database, repo_id, branch).await?)
-}
-
-fn write_index_output(
-    writer: &mut dyn Write,
-    response: &IndexRepoResponse,
-    full: bool,
-) -> anyhow::Result<()> {
-    writeln!(writer, "repo_root: {}", response.repo_root.display())?;
-    writeln!(writer, "branch: {}", response.branch)?;
-    writeln!(
-        writer,
-        "mode: {}",
-        if full { "full" } else { "incremental" }
-    )?;
-    writeln!(writer, "files_scanned: {}", response.stats.files_scanned)?;
-    writeln!(writer, "files_indexed: {}", response.stats.files_indexed)?;
-    writeln!(writer, "files_skipped: {}", response.stats.files_skipped)?;
-    writeln!(
-        writer,
-        "symbols_extracted: {}",
-        response.stats.symbols_extracted
-    )?;
-    writeln!(
-        writer,
-        "chunks_embedded: {}",
-        response.stats.chunks_embedded
-    )?;
-    writeln!(writer, "duration_ms: {}", response.stats.duration_ms)?;
-    writeln!(writer, "languages:")?;
-
-    let mut items = response.languages.iter().collect::<Vec<_>>();
-    items.sort_by(|left, right| left.0.cmp(right.0));
-    for (language, count) in items {
-        writeln!(writer, "- {language}: {count}")?;
-    }
-
-    Ok(())
-}
-
-async fn lock_repo_operation(repo_root: &Path) -> tokio::sync::OwnedMutexGuard<()> {
-    let map = REPO_OPERATION_LOCKS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
-    let repo_lock = {
-        let mut locks = map.lock().await;
-        locks
-            .entry(repo_root.to_path_buf())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    };
-
-    repo_lock.lock_owned().await
-}
-
-struct IndexingMarker {
-    path: PathBuf,
-}
-
-impl Drop for IndexingMarker {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-async fn acquire_indexing_marker(repo_root: &Path) -> anyhow::Result<IndexingMarker> {
-    let marker_path = indexing_marker_path(repo_root)?;
-
-    for _ in 0..INDEXING_WAIT_RETRIES {
-        clear_stale_indexing_marker(
-            &marker_path,
-            StdDuration::from_secs(INDEXING_MARKER_STALE_SECS),
-        );
-
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker_path)
-        {
-            Ok(_) => return Ok(IndexingMarker { path: marker_path }),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                tokio::time::sleep(StdDuration::from_millis(INDEXING_WAIT_INTERVAL_MS)).await;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to create index marker {}", marker_path.display())
-                });
-            }
-        }
-    }
-
-    Err(anyhow!(
-        "timed out waiting for active index to finish for {}",
-        repo_root.display()
-    ))
-}
-
-async fn wait_for_indexing_marker(repo_root: &Path) -> anyhow::Result<()> {
-    let marker_path = indexing_marker_path(repo_root)?;
-
-    for _ in 0..INDEXING_WAIT_RETRIES {
-        clear_stale_indexing_marker(
-            &marker_path,
-            StdDuration::from_secs(INDEXING_MARKER_STALE_SECS),
-        );
-
-        if !marker_path.exists() {
-            return Ok(());
-        }
-
-        tokio::time::sleep(StdDuration::from_millis(INDEXING_WAIT_INTERVAL_MS)).await;
-    }
-
-    Err(anyhow!(
-        "timed out waiting for active index to finish for {}",
-        repo_root.display()
-    ))
-}
-
-fn indexing_marker_path(repo_root: &Path) -> anyhow::Result<PathBuf> {
-    let db_path = Database::db_path_for_repo(repo_root)?;
-    Ok(PathBuf::from(format!("{}.indexing", db_path.display())))
-}
-
-fn should_retry_repo_operation(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("database is locked")
-        || message.contains("no such table")
-        || message.contains("repository is not indexed for branch")
-}
-
-fn clear_stale_indexing_marker(marker_path: &Path, stale_after: StdDuration) {
-    let is_stale = fs::metadata(marker_path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|elapsed| elapsed >= stale_after);
-
-    if is_stale {
-        let _ = fs::remove_file(marker_path);
-    }
-}
-
-fn write_search_output(
-    writer: &mut dyn Write,
-    response: &SearchRepoResponse,
-) -> anyhow::Result<()> {
-    writeln!(writer, "query: {}", response.query)?;
-    writeln!(writer, "repo_root: {}", response.repo_root.display())?;
-    writeln!(writer, "branch: {}", response.branch)?;
-    writeln!(writer, "total_results: {}", response.total_results)?;
-
-    if response.results.is_empty() {
-        writeln!(writer, "no_results: true")?;
-        return Ok(());
-    }
-
-    for result in &response.results {
-        let display_path = display_path(&response.repo_root, &result.path);
-        writeln!(
-            writer,
-            "- {} [{}] {}:{} score={:.3} match={}",
-            result.name, result.kind, display_path, result.line, result.score, result.match_type
-        )?;
-        writeln!(writer, "  signature: {}", result.signature.trim())?;
-
-        if let Some(doc) = result.doc.as_deref().filter(|doc| !doc.trim().is_empty()) {
-            writeln!(writer, "  doc: {}", single_line(doc))?;
-        }
-
-        writeln!(writer, "  snippet: {}", single_line(&result.snippet))?;
-    }
-
-    Ok(())
-}
-
-fn write_repomap_output(writer: &mut dyn Write, response: &RepoMap) -> anyhow::Result<()> {
-    writeln!(writer, "repo_root: {}", response.repo_root.display())?;
-    writeln!(writer, "branch: {}", response.branch)?;
-    writeln!(writer, "modules: {}", response.modules.len())?;
-
-    for module in &response.modules {
-        let module_path = display_path(&response.repo_root, &module.path);
-        writeln!(writer, "\n## {}", module.name)?;
-        writeln!(writer, "path: {module_path}")?;
-
-        if !module.files.is_empty() {
-            writeln!(writer, "files:")?;
-            for file in &module.files {
-                writeln!(writer, "  - {file}")?;
-            }
-        }
-
-        if !module.symbols.is_empty() {
-            writeln!(writer, "symbols:")?;
-            for sym in &module.symbols {
-                writeln!(
-                    writer,
-                    "  - {} [{}] {}:{} {}",
-                    sym.name,
-                    sym.kind,
-                    sym.file,
-                    sym.line,
-                    sym.signature.trim()
-                )?;
-            }
-        }
-
-        if !module.depends_on.is_empty() {
-            writeln!(writer, "depends_on: {}", module.depends_on.join(", "))?;
-        }
-    }
-
-    Ok(())
-}
-
-fn display_path(repo_root: &Path, path: &Path) -> String {
-    if path.is_absolute() {
-        path.strip_prefix(repo_root)
-            .map(|relative| relative.display().to_string())
-            .unwrap_or_else(|_| path.display().to_string())
-    } else {
-        path.display().to_string()
-    }
-}
-
-fn single_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn canonicalize_repo_root(path: &Path) -> anyhow::Result<PathBuf> {
-    path.canonicalize()
-        .with_context(|| format!("failed to resolve repository path {}", path.display()))
-}
-
-fn change_count(changes: &truesight_engine::ChangeSet) -> usize {
-    changes.added.len() + changes.modified.len() + changes.deleted.len()
-}
-
-fn should_refresh_index(metadata: &IndexMetadata, current_commit_sha: Option<&str>) -> bool {
-    if metadata.status != IndexStatus::Ready {
-        return true;
-    }
-
-    if Utc::now() - metadata.last_indexed_at < Duration::minutes(STALE_INDEX_MAX_AGE_MINUTES) {
-        return false;
-    }
-
-    matches!(
-        (metadata.last_commit_sha.as_deref(), current_commit_sha),
-        (Some(indexed_sha), Some(current_sha)) if indexed_sha != current_sha
-    )
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SearchRepoResponse {
     pub(crate) query: String,
@@ -669,6 +394,9 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::OnceLock;
+
+    use chrono::{Duration, Utc};
+    use truesight_core::IndexMetadata;
 
     mod git_fixture {
         include!(concat!(
@@ -870,21 +598,22 @@ mod tests {
             last_error: None,
         };
 
-        assert!(should_refresh_index(&metadata, Some("new")));
-        assert!(!should_refresh_index(&metadata, Some("old")));
-        assert!(!should_refresh_index(&metadata, None));
+        assert!(runtime::should_refresh_index(&metadata, Some("new")));
+        assert!(!runtime::should_refresh_index(&metadata, Some("old")));
+        assert!(!runtime::should_refresh_index(&metadata, None));
     }
 
     #[test]
     fn stale_indexing_marker_is_removed() {
         let fixture = TempGitFixture::new("rust-fixture");
-        let marker_path = indexing_marker_path(fixture.path()).expect("marker path should resolve");
+        let marker_path =
+            runtime::indexing_marker_path(fixture.path()).expect("marker path should resolve");
         if let Some(parent) = marker_path.parent() {
             fs::create_dir_all(parent).expect("marker parent should exist");
         }
 
         fs::write(&marker_path, b"busy").expect("marker file should be created");
-        clear_stale_indexing_marker(&marker_path, StdDuration::ZERO);
+        runtime::clear_stale_indexing_marker(&marker_path, StdDuration::ZERO);
 
         assert!(
             !marker_path.exists(),
