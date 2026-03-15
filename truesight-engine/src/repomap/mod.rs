@@ -1,9 +1,20 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::Path;
 
-use truesight_core::{CodeUnit, ModuleInfo, RepoMap, Result, Storage, SymbolInfo};
+use truesight_core::{RepoMap, Result, Storage, SymbolInfo};
 
 use crate::repo_context::detect_repo_context;
+
+mod dependencies;
+mod module_accumulator;
+mod paths;
+
+use dependencies::{build_symbol_locations, dependency_hints};
+use module_accumulator::ModuleAccumulator;
+use paths::{
+    file_name_for_symbol, matches_filter, module_name, module_path, normalized_filter,
+    relative_path,
+};
 
 pub struct RepoMapGenerator;
 
@@ -38,7 +49,7 @@ impl RepoMapGenerator {
         }
 
         let symbol_locations = build_symbol_locations(root, &units);
-        let mut modules = BTreeMap::<PathBuf, ModuleAccumulator>::new();
+        let mut modules = BTreeMap::<std::path::PathBuf, ModuleAccumulator>::new();
 
         for unit in units {
             let relative_path = relative_path(root, &unit.file_path);
@@ -63,12 +74,7 @@ impl RepoMapGenerator {
 
             module.files.insert(file_name.clone());
             module.units.push(unit);
-            module.symbols.push(OrderedSymbol {
-                file_sort_key: relative_path,
-                line: symbol.line,
-                name_sort_key: symbol.name.clone(),
-                symbol,
-            });
+            module.push_symbol(relative_path, symbol);
         }
 
         for module in modules.values_mut() {
@@ -85,186 +91,6 @@ impl RepoMapGenerator {
                 .collect(),
         })
     }
-}
-
-fn normalized_filter(filter: Option<&str>) -> Option<String> {
-    filter
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.trim_matches('/').replace('\\', "/"))
-        .filter(|value| !value.is_empty() && value != ".")
-}
-
-fn matches_filter(root: &Path, file_path: &Path, filter: Option<&str>) -> bool {
-    let Some(filter) = filter else {
-        return true;
-    };
-
-    let relative = relative_path(root, file_path)
-        .to_string_lossy()
-        .replace('\\', "/");
-    relative == filter || relative.starts_with(&format!("{filter}/"))
-}
-
-#[derive(Debug)]
-struct ModuleAccumulator {
-    name: String,
-    path: PathBuf,
-    files: BTreeSet<String>,
-    units: Vec<CodeUnit>,
-    symbols: Vec<OrderedSymbol>,
-    depends_on: Vec<String>,
-}
-
-impl ModuleAccumulator {
-    fn new(name: String, path: PathBuf) -> Self {
-        Self {
-            name,
-            path,
-            files: BTreeSet::new(),
-            units: Vec::new(),
-            symbols: Vec::new(),
-            depends_on: Vec::new(),
-        }
-    }
-
-    fn finish(mut self) -> ModuleInfo {
-        self.symbols.sort_by(|left, right| {
-            left.file_sort_key
-                .cmp(&right.file_sort_key)
-                .then_with(|| left.line.cmp(&right.line))
-                .then_with(|| left.name_sort_key.cmp(&right.name_sort_key))
-        });
-
-        ModuleInfo {
-            name: self.name,
-            path: self.path,
-            files: self.files.into_iter().collect(),
-            symbols: self.symbols.into_iter().map(|entry| entry.symbol).collect(),
-            depends_on: self.depends_on,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct OrderedSymbol {
-    file_sort_key: PathBuf,
-    line: u32,
-    name_sort_key: String,
-    symbol: SymbolInfo,
-}
-
-fn build_symbol_locations(root: &Path, units: &[CodeUnit]) -> BTreeMap<String, BTreeSet<String>> {
-    let mut locations = BTreeMap::<String, BTreeSet<String>>::new();
-
-    for unit in units {
-        let relative_path = relative_path(root, &unit.file_path);
-        let label = module_label(root, &module_path(&relative_path));
-        locations
-            .entry(unit.name.clone())
-            .or_default()
-            .insert(label);
-    }
-
-    locations
-}
-
-fn dependency_hints(
-    root: &Path,
-    current_module_path: &Path,
-    units: &[CodeUnit],
-    symbol_locations: &BTreeMap<String, BTreeSet<String>>,
-) -> Vec<String> {
-    let current_label = module_label(root, current_module_path);
-    let mut depends_on = BTreeSet::new();
-
-    for unit in units {
-        for token in identifier_tokens(&unit.signature)
-            .into_iter()
-            .chain(identifier_tokens(&unit.content))
-        {
-            if let Some(modules) = symbol_locations.get(&token) {
-                for module in modules {
-                    if module != &current_label {
-                        depends_on.insert(module.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    depends_on.into_iter().collect()
-}
-
-fn identifier_tokens(text: &str) -> Vec<String> {
-    let mut tokens = BTreeSet::new();
-    let mut current = String::new();
-
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            current.push(ch);
-        } else if !current.is_empty() {
-            tokens.insert(std::mem::take(&mut current));
-        }
-    }
-
-    if !current.is_empty() {
-        tokens.insert(current);
-    }
-
-    tokens.into_iter().collect()
-}
-
-fn relative_path(root: &Path, file_path: &Path) -> PathBuf {
-    if file_path.is_absolute() {
-        file_path
-            .strip_prefix(root)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|_| file_path.to_path_buf())
-    } else {
-        file_path.to_path_buf()
-    }
-}
-
-fn module_path(file_path: &Path) -> PathBuf {
-    file_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn module_name(root: &Path, current_module_path: &Path) -> String {
-    if current_module_path == Path::new(".") {
-        root.file_name()
-            .and_then(|segment| segment.to_str())
-            .filter(|segment| !segment.is_empty())
-            .unwrap_or("root")
-            .to_string()
-    } else {
-        current_module_path
-            .file_name()
-            .and_then(|segment| segment.to_str())
-            .filter(|segment| !segment.is_empty())
-            .unwrap_or("root")
-            .to_string()
-    }
-}
-
-fn module_label(root: &Path, current_module_path: &Path) -> String {
-    if current_module_path == Path::new(".") {
-        module_name(root, current_module_path)
-    } else {
-        current_module_path.to_string_lossy().replace('\\', "/")
-    }
-}
-
-fn file_name_for_symbol(file_path: &Path) -> String {
-    file_path
-        .file_name()
-        .and_then(|segment| segment.to_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| file_path.to_string_lossy().replace('\\', "/"))
 }
 
 #[cfg(test)]
