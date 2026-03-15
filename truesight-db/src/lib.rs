@@ -31,6 +31,7 @@ use rows::{code_unit_from_row, insert_code_unit};
 use schema::{MIGRATION_TABLE_SQL, ensure_vector_index, run_incremental_migrations};
 use search::{fuse_ranked_results, ranked_result_from_row};
 
+#[derive(Clone)]
 pub struct Database {
     db: Arc<LibsqlDatabase>,
 }

@@ -623,6 +623,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_database_reuses_cached_handle_per_repo_path() {
+        runtime::clear_runtime_caches().await;
+
+        let fixture = TempGitFixture::new("rust-fixture");
+        let first = runtime::open_database(fixture.path())
+            .await
+            .expect("first open should succeed");
+        let second = runtime::open_database(fixture.path())
+            .await
+            .expect("second open should succeed");
+
+        let _ = (first, second);
+        assert_eq!(runtime::cached_database_count().await, 1);
+    }
+
+    #[tokio::test]
     async fn repomap_rust_fixture_snapshot() {
         let _guard = test_lock().lock().await;
         let fixture = TempGitFixture::new("rust-fixture");

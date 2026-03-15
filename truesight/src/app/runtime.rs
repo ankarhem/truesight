@@ -16,13 +16,19 @@ const INDEXING_MARKER_STALE_SECS: u64 = 300;
 static REPO_OPERATION_LOCKS: OnceLock<
     tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 > = OnceLock::new();
+static OPEN_DATABASES: OnceLock<tokio::sync::Mutex<HashMap<PathBuf, Database>>> = OnceLock::new();
 static MIGRATED_DATABASES: OnceLock<tokio::sync::Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 pub(super) async fn open_database(repo_root: &Path) -> Result<Database> {
     let db_path = Database::db_path_for_repo(repo_root)?;
+    if let Some(database) = cached_database(&db_path).await {
+        return Ok(database);
+    }
+
     let database = Database::new(&db_path).await?;
 
     if migrations_cached(&db_path).await && has_migration_table(&database).await? {
+        cache_database(db_path.clone(), &database).await;
         return Ok(database);
     }
 
@@ -31,6 +37,7 @@ pub(super) async fn open_database(repo_root: &Path) -> Result<Database> {
         match database.run_migrations().await {
             Ok(()) => {
                 mark_migrations_cached(db_path.clone()).await;
+                cache_database(db_path.clone(), &database).await;
                 return Ok(database);
             }
             Err(error) if error.to_string().contains("database is locked") && attempts < 20 => {
@@ -40,6 +47,29 @@ pub(super) async fn open_database(repo_root: &Path) -> Result<Database> {
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+async fn cached_database(db_path: &Path) -> Option<Database> {
+    let mut databases = OPEN_DATABASES
+        .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .await;
+
+    if db_path != Path::new(":memory:") && !db_path.exists() {
+        databases.remove(db_path);
+        remove_cached_migrations(db_path).await;
+        return None;
+    }
+
+    databases.get(db_path).cloned()
+}
+
+async fn cache_database(db_path: PathBuf, database: &Database) {
+    OPEN_DATABASES
+        .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .await
+        .insert(db_path, database.clone());
 }
 
 async fn migrations_cached(db_path: &Path) -> bool {
@@ -58,6 +88,14 @@ async fn mark_migrations_cached(db_path: PathBuf) {
         .insert(db_path);
 }
 
+async fn remove_cached_migrations(db_path: &Path) {
+    MIGRATED_DATABASES
+        .get_or_init(|| tokio::sync::Mutex::new(HashSet::new()))
+        .lock()
+        .await
+        .remove(db_path);
+}
+
 async fn has_migration_table(database: &Database) -> Result<bool> {
     let connection = database.connect().await?;
     let mut rows = connection
@@ -72,6 +110,29 @@ async fn has_migration_table(database: &Database) -> Result<bool> {
         .await
         .map_err(|error| anyhow!(error.to_string()))?
         .is_some())
+}
+
+#[cfg(test)]
+pub(super) async fn clear_runtime_caches() {
+    OPEN_DATABASES
+        .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .await
+        .clear();
+    MIGRATED_DATABASES
+        .get_or_init(|| tokio::sync::Mutex::new(HashSet::new()))
+        .lock()
+        .await
+        .clear();
+}
+
+#[cfg(test)]
+pub(super) async fn cached_database_count() -> usize {
+    OPEN_DATABASES
+        .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .await
+        .len()
 }
 
 pub(super) async fn branch_has_index(
