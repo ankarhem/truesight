@@ -18,12 +18,12 @@ impl OnnxEmbedder {
                 ))
             })?;
 
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| TruesightError::Embedding("failed to lock ONNX session".to_string()))?;
+        let mut session =
+            self.inner.session.lock().map_err(|_| {
+                TruesightError::Embedding("failed to lock ONNX session".to_string())
+            })?;
 
-        let outputs = if self.includes_token_type_ids {
+        let outputs = if self.inner.includes_token_type_ids {
             let token_type_ids = TensorRef::from_array_view(encoded.token_type_ids.view())
                 .map_err(|error| {
                     TruesightError::Embedding(format!(

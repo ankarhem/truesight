@@ -6,6 +6,7 @@ use super::{EncodedBatch, OnnxEmbedder};
 impl OnnxEmbedder {
     pub(super) fn encode_batch(&self, texts: &[&str]) -> Result<EncodedBatch> {
         let encodings = self
+            .inner
             .tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|error| {

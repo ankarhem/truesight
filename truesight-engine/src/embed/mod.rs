@@ -3,7 +3,7 @@ use ort::{
     ep,
     session::{Session, builder::GraphOptimizationLevel},
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokenizers::{
     PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection,
     TruncationParams, TruncationStrategy,
@@ -27,14 +27,38 @@ const SENTENCE_OUTPUT_NAMES: &[&str] = &["sentence_embedding", "sentence_embeddi
 const TOKEN_OUTPUT_NAMES: &[&str] = &["token_embeddings", "last_hidden_state", "embeddings"];
 
 pub struct OnnxEmbedder {
+    inner: Arc<OnnxEmbedderInner>,
+}
+
+struct OnnxEmbedderInner {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
     includes_token_type_ids: bool,
 }
 
+static EMBEDDER_CACHE: OnceLock<Mutex<Option<Arc<OnnxEmbedderInner>>>> = OnceLock::new();
+
 impl OnnxEmbedder {
     pub fn new() -> Result<Self> {
+        let cache = EMBEDDER_CACHE.get_or_init(|| Mutex::new(None));
+        let mut cached = cache
+            .lock()
+            .map_err(|_| TruesightError::Embedding("failed to lock embedder cache".to_string()))?;
+
+        if let Some(inner) = cached.as_ref() {
+            return Ok(Self {
+                inner: inner.clone(),
+            });
+        }
+
         let assets = Self::ensure_model()?;
+        let inner = Arc::new(Self::build_inner(&assets)?);
+        *cached = Some(inner.clone());
+
+        Ok(Self { inner })
+    }
+
+    fn build_inner(assets: &assets::ModelAssets) -> Result<OnnxEmbedderInner> {
         let mut tokenizer = Tokenizer::from_file(&assets.tokenizer).map_err(|error| {
             TruesightError::Embedding(format!("failed to load tokenizer: {error}"))
         })?;
@@ -112,7 +136,7 @@ impl OnnxEmbedder {
             .iter()
             .any(|input| input.name() == "token_type_ids");
 
-        Ok(Self {
+        Ok(OnnxEmbedderInner {
             session: Mutex::new(session),
             tokenizer,
             includes_token_type_ids,
@@ -166,14 +190,10 @@ struct EncodedBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     fn embedder() -> Arc<OnnxEmbedder> {
-        static EMBEDDER: OnceLock<Arc<OnnxEmbedder>> = OnceLock::new();
-
-        EMBEDDER
-            .get_or_init(|| Arc::new(OnnxEmbedder::new().expect("embedder should initialize")))
-            .clone()
+        Arc::new(OnnxEmbedder::new().expect("embedder should initialize"))
     }
 
     fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
@@ -259,5 +279,13 @@ mod tests {
     #[test]
     fn test_dimension() {
         assert_eq!(embedder().dimension(), MODEL_DIMENSION);
+    }
+
+    #[test]
+    fn test_new_reuses_cached_runtime() {
+        let first = OnnxEmbedder::new().expect("first embedder should initialize");
+        let second = OnnxEmbedder::new().expect("second embedder should reuse cache");
+
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
     }
 }
