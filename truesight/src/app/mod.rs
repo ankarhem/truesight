@@ -624,6 +624,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_database_reuses_cached_handle_per_repo_path() {
+        let _guard = test_lock().lock().await;
         runtime::clear_runtime_caches().await;
 
         let fixture = TempGitFixture::new("rust-fixture");

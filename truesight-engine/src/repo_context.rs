@@ -24,11 +24,11 @@ pub fn detect_repo_context(root: &Path) -> Result<RepoContext> {
 }
 
 pub fn detect_repo_context_from_root(repo_root: &Path) -> Result<RepoContext> {
-    let last_commit_sha = git_output(&repo_root, &["rev-parse", "HEAD"]).ok();
+    let (last_commit_sha, branch) = detect_git_metadata(repo_root)?;
 
     Ok(RepoContext {
         repo_id: repo_id_for_root(repo_root),
-        branch: detect_branch_from_root(&repo_root, last_commit_sha.as_deref())?,
+        branch,
         repo_root: repo_root.to_path_buf(),
         last_commit_sha,
     })
@@ -36,8 +36,8 @@ pub fn detect_repo_context_from_root(repo_root: &Path) -> Result<RepoContext> {
 
 pub fn detect_branch(root: &Path) -> Result<String> {
     let repo_root = root.canonicalize()?;
-    let last_commit_sha = git_output(&repo_root, &["rev-parse", "HEAD"]).ok();
-    detect_branch_from_root(&repo_root, last_commit_sha.as_deref())
+    let (_, branch) = detect_git_metadata(&repo_root)?;
+    Ok(branch)
 }
 
 pub fn generate_repo_id(repo_root: &Path) -> Result<String> {
@@ -80,8 +80,49 @@ fn detect_branch_from_root(root: &Path, last_commit_sha: Option<&str>) -> Result
     match git_output(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
         Ok(value) if value == "HEAD" => Ok(detached_branch_name(last_commit_sha)),
         Ok(value) if !value.is_empty() => Ok(value.to_string()),
+        Ok(_) => branch_name_without_head(root),
+        Err(TruesightError::Git(_)) => branch_name_without_head(root),
+        Err(error) => Err(error),
+    }
+}
+
+fn branch_name_without_head(root: &Path) -> Result<String> {
+    match git_output(root, &["branch", "--show-current"]) {
+        Ok(value) if !value.is_empty() => Ok(value),
         Ok(_) => Ok(DEFAULT_BRANCH.to_string()),
         Err(TruesightError::Git(_)) => Ok(DEFAULT_BRANCH.to_string()),
+        Err(error) => Err(error),
+    }
+}
+
+fn detect_git_metadata(root: &Path) -> Result<(Option<String>, String)> {
+    match git_output(root, &["rev-parse", "HEAD", "--abbrev-ref", "HEAD"]) {
+        Ok(output) => {
+            let mut lines = output.lines();
+            let last_commit_sha = lines
+                .next()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string);
+            let branch = lines
+                .next()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|value| {
+                    if value == "HEAD" {
+                        detached_branch_name(last_commit_sha.as_deref())
+                    } else {
+                        value.to_string()
+                    }
+                })
+                .unwrap_or_else(|| detached_branch_name(last_commit_sha.as_deref()));
+            Ok((last_commit_sha, branch))
+        }
+        Err(TruesightError::Git(_)) => {
+            let last_commit_sha = git_output(root, &["rev-parse", "HEAD"]).ok();
+            let branch = detect_branch_from_root(root, last_commit_sha.as_deref())?;
+            Ok((last_commit_sha, branch))
+        }
         Err(error) => Err(error),
     }
 }
@@ -151,6 +192,16 @@ mod tests {
         let branch = detect_branch(temp.path()).expect("non-git branch detection should succeed");
 
         assert_eq!(branch, DEFAULT_BRANCH);
+    }
+
+    #[test]
+    fn detect_branch_returns_main_for_empty_git_repo_without_head() {
+        let temp = TempDir::new().expect("temp dir should exist");
+        run_git(temp.path(), &["init", "-b", "main"]);
+
+        let branch = detect_branch(temp.path()).expect("branch detection should succeed");
+
+        assert_eq!(branch, "main");
     }
 
     #[test]
