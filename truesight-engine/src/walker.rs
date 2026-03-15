@@ -1,9 +1,9 @@
+use crossbeam_channel::{Sender, unbounded};
 use ignore::WalkBuilder;
 use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use truesight_core::{Language, Result, TruesightError};
 
 const BINARY_CHECK_BYTES: usize = 8 * 1024;
@@ -51,8 +51,7 @@ impl FileWalker {
     }
 
     pub fn walk(&self, root: &Path) -> Result<Vec<DiscoveredFile>> {
-        let discovered = Arc::new(Mutex::new(Vec::new()));
-        let errors = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = unbounded();
         let max_file_size = self.max_file_size;
 
         let mut builder = WalkBuilder::new(root);
@@ -67,10 +66,9 @@ impl FileWalker {
             .follow_links(false);
 
         builder.build_parallel().run(|| {
-            let discovered = Arc::clone(&discovered);
-            let errors = Arc::clone(&errors);
+            let tx = tx.clone();
             Box::new(move |entry| {
-                match entry {
+                let event = match entry {
                     Ok(entry) => {
                         if !entry
                             .file_type()
@@ -80,42 +78,50 @@ impl FileWalker {
                         }
 
                         match classify_entry(entry.path(), max_file_size) {
-                            Ok(Some(file)) => {
-                                discovered
-                                    .lock()
-                                    .expect("walker result lock poisoned")
-                                    .push(file);
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                errors
-                                    .lock()
-                                    .expect("walker error lock poisoned")
-                                    .push(error);
-                            }
+                            Ok(Some(file)) => Some(WalkEvent::Discovered(file)),
+                            Ok(None) => None,
+                            Err(error) => Some(WalkEvent::Error(error)),
                         }
                     }
-                    Err(error) => errors
-                        .lock()
-                        .expect("walker error lock poisoned")
-                        .push(TruesightError::Index(error.to_string())),
+                    Err(error) => Some(WalkEvent::Error(TruesightError::Index(error.to_string()))),
+                };
+
+                if let Some(event) = event {
+                    send_walk_event(&tx, event);
                 }
 
                 ignore::WalkState::Continue
             })
         });
+        drop(tx);
 
-        if let Some(error) = errors.lock().expect("walker error lock poisoned").pop() {
+        let mut files = Vec::new();
+        let mut first_error = None;
+
+        for event in rx {
+            match event {
+                WalkEvent::Discovered(file) => files.push(file),
+                WalkEvent::Error(error) if first_error.is_none() => first_error = Some(error),
+                WalkEvent::Error(_) => {}
+            }
+        }
+
+        if let Some(error) = first_error {
             return Err(error);
         }
 
-        let mut files = Arc::try_unwrap(discovered)
-            .expect("walker result still shared")
-            .into_inner()
-            .expect("walker result lock poisoned");
         files.sort_by(compare_discovered_files);
         Ok(files)
     }
+}
+
+enum WalkEvent {
+    Discovered(DiscoveredFile),
+    Error(TruesightError),
+}
+
+fn send_walk_event(sender: &Sender<WalkEvent>, event: WalkEvent) {
+    let _ = sender.send(event);
 }
 
 fn compare_discovered_files(left: &DiscoveredFile, right: &DiscoveredFile) -> Ordering {

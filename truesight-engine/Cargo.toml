@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1"
 chrono = "0.4"
+crossbeam-channel = "0.5"
 truesight-core = { path = "../truesight-core" }
 ndarray = "0.17.2"
 tree-sitter = "0.26"
