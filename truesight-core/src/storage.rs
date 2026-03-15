@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{
     CodeUnit, EmbeddingUpdate, IndexMetadata, IndexedCodeUnit, IndexedFileRecord, PendingEmbedding,
@@ -222,6 +222,38 @@ pub trait IncrementalStorage: IndexStorage {
         branch: &str,
         file_path: &Path,
     ) -> Result<()>;
+
+    async fn apply_incremental_changes(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        deleted_files: &[PathBuf],
+        units: &[IndexedCodeUnit],
+        indexed_files: &[IndexedFileRecord],
+    ) -> Result<()> {
+        for file_path in deleted_files {
+            self.delete_units_for_file(repo_id, branch, file_path)
+                .await?;
+            self.delete_indexed_file(repo_id, branch, file_path).await?;
+        }
+
+        if !units.is_empty() {
+            self.store_indexed_units(repo_id, branch, units).await?;
+        }
+
+        for file in indexed_files {
+            self.upsert_indexed_file(
+                repo_id,
+                branch,
+                &file.file_path,
+                &file.file_hash,
+                file.chunk_count,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "mocking")]
