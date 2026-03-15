@@ -34,24 +34,36 @@ impl OnnxEmbedder {
 
     pub(super) fn ensure_model() -> Result<ModelAssets> {
         std::thread::scope(|s| {
-            s.spawn(|| {
-                let model_dir = Self::model_dir()?;
-                fs::create_dir_all(&model_dir)?;
+            let model_dir = Self::model_dir()?;
+            fs::create_dir_all(&model_dir)?;
 
-                let model = model_dir.join("model.onnx");
-                let tokenizer = model_dir.join("tokenizer.json");
+            let model = model_dir.join("model.onnx");
+            let tokenizer = model_dir.join("tokenizer.json");
 
-                Self::ensure_file(&model, MODEL_URL, MODEL_SHA256)?;
-                Self::ensure_file(&tokenizer, TOKENIZER_URL, TOKENIZER_SHA256)?;
+            let model_path = model.clone();
+            let tokenizer_path = tokenizer.clone();
 
-                Ok(ModelAssets { model, tokenizer })
-            })
-            .join()
-            .unwrap_or_else(|_| {
+            let model_task = s.spawn(move || {
+                Self::ensure_file(&model_path, MODEL_URL, MODEL_SHA256)?;
+                Ok::<_, TruesightError>(())
+            });
+            let tokenizer_task = s.spawn(move || {
+                Self::ensure_file(&tokenizer_path, TOKENIZER_URL, TOKENIZER_SHA256)?;
+                Ok::<_, TruesightError>(())
+            });
+
+            model_task.join().unwrap_or_else(|_| {
                 Err(TruesightError::Embedding(
                     "model download thread panicked".into(),
                 ))
-            })
+            })?;
+            tokenizer_task.join().unwrap_or_else(|_| {
+                Err(TruesightError::Embedding(
+                    "tokenizer download thread panicked".into(),
+                ))
+            })?;
+
+            Ok(ModelAssets { model, tokenizer })
         })
     }
 
