@@ -10,7 +10,7 @@ use truesight_core::{IndexStats, RepoMap, SearchConfig, SearchResult, Storage};
 use truesight_db::Database;
 use truesight_engine::{
     IncrementalIndexer, OnnxEmbedder, RepoContext, RepoMapGenerator, SearchEngine,
-    detect_repo_context, index_repo,
+    detect_repo_context_from_root, index_repo,
 };
 
 use crate::cli::{Cli, Commands, IndexArgs, RepoMapArgs, SearchArgs};
@@ -50,7 +50,7 @@ impl AppServices {
         full: bool,
     ) -> anyhow::Result<IndexRepoResponse> {
         let _marker = runtime::acquire_indexing_marker(&repo_root).await?;
-        let context = detect_repo_context(&repo_root)?;
+        let context = detect_repo_context_from_root(&repo_root)?;
         let database = open_database(&repo_root).await?;
         let embedder = OnnxEmbedder::new().context("failed to initialize embedder")?;
 
@@ -204,7 +204,7 @@ impl AppServices {
         for attempt in 0..=SEARCH_RETRY_ATTEMPTS {
             wait_for_indexing_marker(&repo_root).await?;
 
-            let context = detect_repo_context(&repo_root)?;
+            let context = detect_repo_context_from_root(&repo_root)?;
             let database = open_database(&repo_root).await?;
             let result = async {
                 let metadata =
@@ -254,7 +254,7 @@ impl AppServices {
         for attempt in 0..=SEARCH_RETRY_ATTEMPTS {
             wait_for_indexing_marker(&repo_root).await?;
 
-            let context = detect_repo_context(&repo_root)?;
+            let context = detect_repo_context_from_root(&repo_root)?;
             let database = open_database(&repo_root).await?;
             let result = async {
                 let metadata =

@@ -1,11 +1,14 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
 use truesight_core::{Result, TruesightError};
 
 pub const DEFAULT_BRANCH: &str = "default";
+static REPO_ID_CACHE: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoContext {
@@ -17,12 +20,16 @@ pub struct RepoContext {
 
 pub fn detect_repo_context(root: &Path) -> Result<RepoContext> {
     let repo_root = root.canonicalize()?;
+    detect_repo_context_from_root(&repo_root)
+}
+
+pub fn detect_repo_context_from_root(repo_root: &Path) -> Result<RepoContext> {
     let last_commit_sha = git_output(&repo_root, &["rev-parse", "HEAD"]).ok();
 
     Ok(RepoContext {
-        repo_id: generate_repo_id(&repo_root)?,
+        repo_id: repo_id_for_root(repo_root),
         branch: detect_branch_from_root(&repo_root, last_commit_sha.as_deref())?,
-        repo_root,
+        repo_root: repo_root.to_path_buf(),
         last_commit_sha,
     })
 }
@@ -35,6 +42,19 @@ pub fn detect_branch(root: &Path) -> Result<String> {
 
 pub fn generate_repo_id(repo_root: &Path) -> Result<String> {
     let repo_root = repo_root.canonicalize()?;
+    Ok(repo_id_for_root(&repo_root))
+}
+
+fn repo_id_for_root(repo_root: &Path) -> String {
+    if let Some(repo_id) = repo_id_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(repo_root)
+        .cloned()
+    {
+        return repo_id;
+    }
+
     let mut hasher = Sha256::new();
     hasher.update(repo_root.to_string_lossy().as_bytes());
     let digest = hasher.finalize();
@@ -44,7 +64,16 @@ pub fn generate_repo_id(repo_root: &Path) -> Result<String> {
         let _ = write!(&mut hex, "{byte:02x}");
     }
 
-    Ok(hex)
+    repo_id_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(repo_root.to_path_buf(), hex.clone());
+
+    hex
+}
+
+fn repo_id_cache() -> &'static Mutex<HashMap<PathBuf, String>> {
+    REPO_ID_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn detect_branch_from_root(root: &Path, last_commit_sha: Option<&str>) -> Result<String> {
@@ -88,7 +117,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{DEFAULT_BRANCH, detect_branch, detect_repo_context, generate_repo_id};
+    use super::{
+        DEFAULT_BRANCH, detect_branch, detect_repo_context, detect_repo_context_from_root,
+        generate_repo_id, repo_id_cache,
+    };
 
     #[test]
     fn detect_branch_returns_named_branch_for_git_repo() {
@@ -141,6 +173,26 @@ mod tests {
                 .canonicalize()
                 .expect("canonical path should exist")
         );
+    }
+
+    #[test]
+    fn detect_repo_context_from_root_reuses_cached_repo_id() {
+        let temp = git_repo();
+        let repo_root = temp
+            .path()
+            .canonicalize()
+            .expect("canonical path should exist");
+
+        let first = detect_repo_context_from_root(&repo_root).expect("context should resolve");
+        let second = detect_repo_context_from_root(&repo_root).expect("context should resolve");
+        let cached = repo_id_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&repo_root)
+            .cloned();
+
+        assert_eq!(first.repo_id, second.repo_id);
+        assert_eq!(cached.as_deref(), Some(first.repo_id.as_str()));
     }
 
     fn git_repo() -> TempDir {
