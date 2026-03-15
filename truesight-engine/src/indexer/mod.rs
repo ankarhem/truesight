@@ -1,41 +1,23 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use chrono::Utc;
 use rayon::prelude::*;
 use tracing::warn;
 use truesight_core::{
-    CodeUnit, Embedder, IndexMetadata, IndexStats, IndexStatus, IndexStorage, IndexedCodeUnit,
-    IndexedFileRecord, Language, Result,
+    Embedder, IndexMetadata, IndexStats, IndexStatus, IndexStorage, IndexedFileRecord, Result,
 };
 
-use crate::indexing::{build_pending_units, materialize_embeddings, repo_relative_path};
+use crate::indexer::components::{FileDiscovery, SourceParser};
+use crate::indexer::processing::process_file;
+use crate::indexing::materialize_embeddings;
 use crate::parser::CodeParser;
 use crate::repo_context::detect_repo_context;
-use crate::util::hash_bytes;
-use crate::walker::{DiscoveredFile, FileWalker};
+use crate::walker::FileWalker;
 
-pub(crate) trait FileDiscovery: Send + Sync {
-    fn walk(&self, root: &Path) -> Result<Vec<DiscoveredFile>>;
-}
-
-pub(crate) trait SourceParser: Send + Sync {
-    fn parse_file(&self, path: &Path, source: &[u8], language: Language) -> Result<Vec<CodeUnit>>;
-}
-
-impl FileDiscovery for FileWalker {
-    fn walk(&self, root: &Path) -> Result<Vec<DiscoveredFile>> {
-        FileWalker::walk(self, root)
-    }
-}
-
-impl SourceParser for CodeParser {
-    fn parse_file(&self, path: &Path, source: &[u8], language: Language) -> Result<Vec<CodeUnit>> {
-        CodeParser::parse_file(self, path, source, language)
-    }
-}
+mod components;
+mod processing;
 
 pub(crate) struct Indexer<W = FileWalker, P = CodeParser> {
     walker: W,
@@ -157,53 +139,11 @@ where
     Indexer::new()?.index_repo(root, storage, embedder).await
 }
 
-fn process_file<P>(
-    index: usize,
-    total: usize,
-    root: &Path,
-    file: &DiscoveredFile,
-    parser: &P,
-) -> Result<ProcessedFile>
-where
-    P: SourceParser,
-{
-    tracing::info!(file_number = index, total_files = total, path = %file.path.display(), "indexing file");
-
-    let source = fs::read(&file.path)?;
-    let file_hash = hash_bytes(&source);
-    let relative_path = repo_relative_path(root, &file.path)?;
-    let parsed_units = parser.parse_file(&relative_path, &source, file.language)?;
-
-    if parsed_units.is_empty() {
-        return Ok(ProcessedFile {
-            path: relative_path,
-            language: file.language,
-            file_hash,
-            units: Vec::new(),
-        });
-    }
-
-    let units = build_pending_units(parsed_units, &file_hash);
-
-    Ok(ProcessedFile {
-        path: relative_path,
-        language: file.language,
-        file_hash,
-        units,
-    })
-}
-
-#[derive(Debug, Clone)]
-struct ProcessedFile {
-    path: PathBuf,
-    language: Language,
-    file_hash: String,
-    units: Vec<IndexedCodeUnit>,
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     mod git_fixture {
         include!(concat!(
@@ -221,22 +161,23 @@ mod tests {
 
     use tempfile::TempDir;
     use truesight_core::{
-        IndexStatus, IndexStorage, IndexedCodeUnit, IndexedFileRecord, MockIndexStorage,
-        TruesightError,
+        CodeUnit, IndexStatus, IndexStorage, IndexedCodeUnit, IndexedFileRecord, Language,
+        MockIndexStorage, TruesightError,
     };
 
     use super::*;
+    use crate::indexer::components::SourceParser;
     use git_fixture::{TempGitFixture, init_empty_git_repo};
     use storage_fakes::{DeterministicFakeEmbedder as FakeEmbedder, RecordingStorage};
 
     struct ControlledParser {
-        inner: CodeParser,
+        inner: crate::parser::CodeParser,
     }
 
     impl ControlledParser {
         fn new() -> Self {
             Self {
-                inner: CodeParser::new().expect("parser should initialize"),
+                inner: crate::parser::CodeParser::new().expect("parser should initialize"),
             }
         }
     }
@@ -406,7 +347,8 @@ mod tests {
         .expect("broken source write should succeed");
 
         let storage = RecordingStorage::default();
-        let indexer = Indexer::with_components(FileWalker::new(), ControlledParser::new());
+        let indexer =
+            Indexer::with_components(crate::walker::FileWalker::new(), ControlledParser::new());
         let stats = indexer
             .index_repo(temp_dir.path(), &storage, &FakeEmbedder)
             .await
