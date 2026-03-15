@@ -458,6 +458,7 @@ pub struct EmbeddingUpdate {
 // =============================================================================
 
 /// Trait for storage backends that persist and query code units.
+#[cfg_attr(feature = "mocking", mockall::automock)]
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Store code units for a repository/branch.
@@ -579,6 +580,86 @@ pub trait IndexStorage: Storage {
     }
 }
 
+#[cfg(feature = "mocking")]
+mockall::mock! {
+    pub IndexStorage {}
+
+    #[async_trait]
+    impl Storage for IndexStorage {
+        async fn store_code_units(&self, repo_id: &str, branch: &str, units: &[CodeUnit])
+            -> Result<()>;
+        async fn search_fts(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            query: &str,
+            limit: usize,
+        ) -> Result<Vec<RankedResult>>;
+        async fn search_vector(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            embedding: &[f32],
+            limit: usize,
+        ) -> Result<Vec<RankedResult>>;
+        async fn search_hybrid(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            query: &str,
+            embedding: &[f32],
+            limit: usize,
+            rrf_k: u32,
+        ) -> Result<Vec<RankedResult>>;
+        async fn get_index_metadata(
+            &self,
+            repo_id: &str,
+            branch: &str,
+        ) -> Result<Option<IndexMetadata>>;
+        async fn has_indexed_symbols(&self, repo_id: &str, branch: &str) -> Result<bool>;
+        async fn set_index_metadata(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            meta: &IndexMetadata,
+        ) -> Result<()>;
+        async fn delete_branch_index(&self, repo_id: &str, branch: &str) -> Result<()>;
+        async fn get_all_symbols(&self, repo_id: &str, branch: &str) -> Result<Vec<CodeUnit>>;
+    }
+
+    #[async_trait]
+    impl IndexStorage for IndexStorage {
+        async fn store_indexed_units(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            units: &[IndexedCodeUnit],
+        ) -> Result<()>;
+        async fn upsert_indexed_file(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            file_path: &Path,
+            file_hash: &str,
+            chunk_count: u32,
+        ) -> Result<()>;
+        async fn list_pending_embeddings(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            embedding_model: &str,
+            limit: usize,
+        ) -> Result<Vec<PendingEmbedding>>;
+        async fn update_embeddings(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            embedding_model: &str,
+            updates: &[EmbeddingUpdate],
+        ) -> Result<()>;
+    }
+}
+
 #[async_trait]
 pub trait IncrementalStorage: IndexStorage {
     async fn get_indexed_files(
@@ -602,13 +683,115 @@ pub trait IncrementalStorage: IndexStorage {
     ) -> Result<()>;
 }
 
+#[cfg(feature = "mocking")]
+mockall::mock! {
+    pub IncrementalStorage {}
+
+    #[async_trait]
+    impl Storage for IncrementalStorage {
+        async fn store_code_units(&self, repo_id: &str, branch: &str, units: &[CodeUnit])
+            -> Result<()>;
+        async fn search_fts(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            query: &str,
+            limit: usize,
+        ) -> Result<Vec<RankedResult>>;
+        async fn search_vector(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            embedding: &[f32],
+            limit: usize,
+        ) -> Result<Vec<RankedResult>>;
+        async fn search_hybrid(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            query: &str,
+            embedding: &[f32],
+            limit: usize,
+            rrf_k: u32,
+        ) -> Result<Vec<RankedResult>>;
+        async fn get_index_metadata(
+            &self,
+            repo_id: &str,
+            branch: &str,
+        ) -> Result<Option<IndexMetadata>>;
+        async fn has_indexed_symbols(&self, repo_id: &str, branch: &str) -> Result<bool>;
+        async fn set_index_metadata(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            meta: &IndexMetadata,
+        ) -> Result<()>;
+        async fn delete_branch_index(&self, repo_id: &str, branch: &str) -> Result<()>;
+        async fn get_all_symbols(&self, repo_id: &str, branch: &str) -> Result<Vec<CodeUnit>>;
+    }
+
+    #[async_trait]
+    impl IndexStorage for IncrementalStorage {
+        async fn store_indexed_units(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            units: &[IndexedCodeUnit],
+        ) -> Result<()>;
+        async fn upsert_indexed_file(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            file_path: &Path,
+            file_hash: &str,
+            chunk_count: u32,
+        ) -> Result<()>;
+        async fn list_pending_embeddings(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            embedding_model: &str,
+            limit: usize,
+        ) -> Result<Vec<PendingEmbedding>>;
+        async fn update_embeddings(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            embedding_model: &str,
+            updates: &[EmbeddingUpdate],
+        ) -> Result<()>;
+    }
+
+    #[async_trait]
+    impl IncrementalStorage for IncrementalStorage {
+        async fn get_indexed_files(
+            &self,
+            repo_id: &str,
+            branch: &str,
+        ) -> Result<Vec<IndexedFileRecord>>;
+        async fn delete_units_for_file(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            file_path: &Path,
+        ) -> Result<()>;
+        async fn delete_indexed_file(
+            &self,
+            repo_id: &str,
+            branch: &str,
+            file_path: &Path,
+        ) -> Result<()>;
+    }
+}
+
 /// Trait for embedding text into dense vectors.
+#[cfg_attr(feature = "mocking", mockall::automock)]
 pub trait Embedder: Send + Sync {
     /// Embed a single text string.
     fn embed(&self, text: &str) -> Result<Vec<f32>>;
 
     /// Embed multiple text strings in batch.
-    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+    fn embed_batch<'a>(&self, texts: &[&'a str]) -> Result<Vec<Vec<f32>>>;
 
     /// Get the dimension of the embedding vectors.
     fn dimension(&self) -> usize;

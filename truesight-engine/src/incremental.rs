@@ -397,8 +397,9 @@ mod tests {
     use chrono::Utc;
     use tempfile::TempDir;
     use truesight_core::{
-        Embedder, EmbeddingUpdate, IncrementalStorage, IndexMetadata, IndexStorage,
-        IndexedCodeUnit, IndexedFileRecord, Language, PendingEmbedding, RankedResult, Storage,
+        Embedder, EmbeddingUpdate, IncrementalStorage, IndexMetadata, IndexStatus, IndexStorage,
+        IndexedCodeUnit, IndexedFileRecord, Language, MockIncrementalStorage, PendingEmbedding,
+        RankedResult, Storage,
     };
 
     #[derive(Clone, Default)]
@@ -655,7 +656,7 @@ mod tests {
             Ok(vector)
         }
 
-        fn embed_batch(&self, texts: &[&str]) -> truesight_core::Result<Vec<Vec<f32>>> {
+        fn embed_batch<'a>(&self, texts: &[&'a str]) -> truesight_core::Result<Vec<Vec<f32>>> {
             texts.iter().map(|text| self.embed(text)).collect()
         }
 
@@ -675,6 +676,118 @@ mod tests {
             unit.name,
             unit.line_start
         )
+    }
+
+    #[tokio::test]
+    async fn generated_mock_incremental_storage_supports_full_trait_hierarchy() {
+        let mut storage = MockIncrementalStorage::new();
+        let repo_id = "/tmp/repo";
+        let branch = "main";
+        let indexed_file = IndexedFileRecord {
+            file_path: PathBuf::from("src/lib.rs"),
+            file_hash: "hash-alpha".to_string(),
+            chunk_count: 1,
+            indexed_at: Utc::now(),
+        };
+        let metadata = IndexMetadata {
+            repo_id: repo_id.to_string(),
+            branch: branch.to_string(),
+            status: IndexStatus::Ready,
+            last_indexed_at: Utc::now(),
+            last_commit_sha: Some("abc123".to_string()),
+            last_seen_commit_sha: Some("abc123".to_string()),
+            file_count: 1,
+            symbol_count: 1,
+            embedding_model: "fake-model".to_string(),
+            last_error: None,
+        };
+
+        storage
+            .expect_search_fts()
+            .times(1)
+            .withf(|actual_repo, actual_branch, query, limit| {
+                actual_repo == "/tmp/repo"
+                    && actual_branch == "main"
+                    && query == "alpha"
+                    && *limit == 1
+            })
+            .returning(|_, _, _, _| Ok(Vec::new()));
+        storage
+            .expect_list_pending_embeddings()
+            .times(1)
+            .withf(|actual_repo, actual_branch, embedding_model, limit| {
+                actual_repo == "/tmp/repo"
+                    && actual_branch == "main"
+                    && embedding_model == "fake-model"
+                    && *limit == 4
+            })
+            .returning(|_, _, _, _| Ok(Vec::new()));
+        storage
+            .expect_get_indexed_files()
+            .times(1)
+            .withf(move |actual_repo, actual_branch| {
+                actual_repo == repo_id && actual_branch == branch
+            })
+            .returning(move |_, _| Ok(vec![indexed_file.clone()]));
+        storage
+            .expect_delete_units_for_file()
+            .times(1)
+            .withf(|actual_repo, actual_branch, file_path| {
+                actual_repo == "/tmp/repo"
+                    && actual_branch == "main"
+                    && file_path == Path::new("src/lib.rs")
+            })
+            .returning(|_, _, _| Ok(()));
+        storage
+            .expect_delete_indexed_file()
+            .times(1)
+            .withf(|actual_repo, actual_branch, file_path| {
+                actual_repo == "/tmp/repo"
+                    && actual_branch == "main"
+                    && file_path == Path::new("src/lib.rs")
+            })
+            .returning(|_, _, _| Ok(()));
+        storage
+            .expect_set_index_metadata()
+            .times(1)
+            .withf(|actual_repo, actual_branch, actual_metadata| {
+                actual_repo == "/tmp/repo"
+                    && actual_branch == "main"
+                    && actual_metadata.embedding_model == "fake-model"
+                    && actual_metadata.status == IndexStatus::Ready
+            })
+            .returning(|_, _, _| Ok(()));
+
+        let results = Storage::search_fts(&storage, repo_id, branch, "alpha", 1)
+            .await
+            .expect("generated MockIncrementalStorage should support Storage methods");
+        assert!(results.is_empty());
+
+        let pending =
+            IndexStorage::list_pending_embeddings(&storage, repo_id, branch, "fake-model", 4)
+                .await
+                .expect("generated MockIncrementalStorage should support IndexStorage methods");
+        assert!(pending.is_empty());
+
+        let files = IncrementalStorage::get_indexed_files(&storage, repo_id, branch)
+            .await
+            .expect("generated MockIncrementalStorage should support IncrementalStorage methods");
+        assert_eq!(files.len(), 1);
+
+        IncrementalStorage::delete_units_for_file(
+            &storage,
+            repo_id,
+            branch,
+            Path::new("src/lib.rs"),
+        )
+        .await
+        .expect("generated MockIncrementalStorage should delete units");
+        IncrementalStorage::delete_indexed_file(&storage, repo_id, branch, Path::new("src/lib.rs"))
+            .await
+            .expect("generated MockIncrementalStorage should delete indexed files");
+        Storage::set_index_metadata(&storage, repo_id, branch, &metadata)
+            .await
+            .expect("generated MockIncrementalStorage should support inherited storage updates");
     }
 
     #[tokio::test]

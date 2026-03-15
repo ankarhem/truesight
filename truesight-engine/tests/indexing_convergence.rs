@@ -275,7 +275,7 @@ impl Embedder for FakeEmbedder {
         ])
     }
 
-    fn embed_batch(&self, texts: &[&str]) -> truesight_core::Result<Vec<Vec<f32>>> {
+    fn embed_batch<'a>(&self, texts: &[&'a str]) -> truesight_core::Result<Vec<Vec<f32>>> {
         texts.iter().map(|text| self.embed(text)).collect()
     }
 

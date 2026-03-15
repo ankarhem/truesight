@@ -26,6 +26,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 async-trait = "0.1"
+truesight-core = { path = "../truesight-core", features = ["mocking"] }
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

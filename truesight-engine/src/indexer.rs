@@ -216,8 +216,8 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::TempDir;
     use truesight_core::{
-        EmbeddingUpdate, IndexStorage, IndexedCodeUnit, IndexedFileRecord, PendingEmbedding,
-        RankedResult, Storage, TruesightError,
+        EmbeddingUpdate, IndexStatus, IndexStorage, IndexedCodeUnit, IndexedFileRecord,
+        MockIndexStorage, PendingEmbedding, RankedResult, Storage, TruesightError,
     };
 
     use super::*;
@@ -422,7 +422,7 @@ mod tests {
             Ok(vec![length, length / 2.0, length / 4.0, 1.0])
         }
 
-        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        fn embed_batch<'a>(&self, texts: &[&'a str]) -> Result<Vec<Vec<f32>>> {
             texts.iter().map(|text| self.embed(text)).collect()
         }
 
@@ -470,6 +470,99 @@ mod tests {
             }
             self.inner.parse_file(path, source, language)
         }
+    }
+
+    #[tokio::test]
+    async fn generated_mock_index_storage_supports_replace_branch_index() {
+        let mut storage = MockIndexStorage::new();
+        let repo_id = "/tmp/repo";
+        let branch = "main";
+        let units = vec![IndexedCodeUnit {
+            unit: CodeUnit {
+                name: "alpha".to_string(),
+                kind: truesight_core::CodeUnitKind::Function,
+                signature: "pub fn alpha()".to_string(),
+                doc: None,
+                file_path: PathBuf::from("src/lib.rs"),
+                line_start: 1,
+                line_end: 3,
+                content: "pub fn alpha() {}".to_string(),
+                parent: None,
+                language: Language::Rust,
+            },
+            embedding: None,
+            file_hash: Some("hash-alpha".to_string()),
+        }];
+        let indexed_files = vec![IndexedFileRecord {
+            file_path: PathBuf::from("src/lib.rs"),
+            file_hash: "hash-alpha".to_string(),
+            chunk_count: 1,
+            indexed_at: Utc::now(),
+        }];
+        let metadata = IndexMetadata {
+            repo_id: repo_id.to_string(),
+            branch: branch.to_string(),
+            status: IndexStatus::Ready,
+            last_indexed_at: Utc::now(),
+            last_commit_sha: Some("abc123".to_string()),
+            last_seen_commit_sha: Some("abc123".to_string()),
+            file_count: 1,
+            symbol_count: 1,
+            embedding_model: "fake-model".to_string(),
+            last_error: None,
+        };
+
+        storage
+            .expect_delete_branch_index()
+            .times(1)
+            .withf(move |actual_repo, actual_branch| {
+                actual_repo == repo_id && actual_branch == branch
+            })
+            .returning(|_, _| Ok(()));
+        storage
+            .expect_store_indexed_units()
+            .times(1)
+            .withf(|actual_repo, actual_branch, actual_units| {
+                actual_repo == "/tmp/repo"
+                    && actual_branch == "main"
+                    && actual_units.len() == 1
+                    && actual_units[0].unit.name == "alpha"
+            })
+            .returning(|_, _, _| Ok(()));
+        storage
+            .expect_upsert_indexed_file()
+            .times(1)
+            .withf(
+                |actual_repo, actual_branch, file_path, file_hash, chunk_count| {
+                    actual_repo == "/tmp/repo"
+                        && actual_branch == "main"
+                        && file_path == Path::new("src/lib.rs")
+                        && file_hash == "hash-alpha"
+                        && *chunk_count == 1
+                },
+            )
+            .returning(|_, _, _, _, _| Ok(()));
+        storage
+            .expect_set_index_metadata()
+            .times(1)
+            .withf(|actual_repo, actual_branch, actual_metadata| {
+                actual_repo == "/tmp/repo"
+                    && actual_branch == "main"
+                    && actual_metadata.embedding_model == "fake-model"
+                    && actual_metadata.symbol_count == 1
+            })
+            .returning(|_, _, _| Ok(()));
+
+        IndexStorage::replace_branch_index(
+            &storage,
+            repo_id,
+            branch,
+            &units,
+            &indexed_files,
+            &metadata,
+        )
+        .await
+        .expect("generated MockIndexStorage should support replace_branch_index");
     }
 
     #[tokio::test]

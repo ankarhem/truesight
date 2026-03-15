@@ -242,143 +242,69 @@ fn snippet_from_content(unit: &CodeUnit) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use async_trait::async_trait;
     use truesight_core::{
-        CodeUnitKind, Embedder, IndexMetadata, Language, MatchType, RankedResult, Result,
-        SearchConfig, Storage, TruesightError,
+        CodeUnitKind, Language, MatchType, MockEmbedder, MockStorage, RankedResult, SearchConfig,
+        TruesightError,
     };
 
     use super::{SearchEngine, search};
 
-    struct FakeStorage {
-        fts_results: Vec<RankedResult>,
-        vector_results: Vec<RankedResult>,
-        hybrid_results: Vec<RankedResult>,
-        vector_error: Option<String>,
-        hybrid_error: Option<String>,
+    fn expect_fts_results(storage: &mut MockStorage, results: Vec<RankedResult>) {
+        storage
+            .expect_search_fts()
+            .times(1)
+            .returning(move |_, _, _, limit| Ok(results.iter().take(limit).cloned().collect()));
     }
 
-    #[async_trait]
-    impl Storage for FakeStorage {
-        async fn store_code_units(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            _units: &[truesight_core::CodeUnit],
-        ) -> Result<()> {
-            unreachable!("storage writes are not used in search tests")
-        }
-
-        async fn search_fts(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            _query: &str,
-            limit: usize,
-        ) -> Result<Vec<RankedResult>> {
-            Ok(self.fts_results.iter().take(limit).cloned().collect())
-        }
-
-        async fn search_vector(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            _embedding: &[f32],
-            limit: usize,
-        ) -> Result<Vec<RankedResult>> {
-            if let Some(message) = &self.vector_error {
-                return Err(TruesightError::Database(message.clone()));
-            }
-
-            Ok(self.vector_results.iter().take(limit).cloned().collect())
-        }
-
-        async fn search_hybrid(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            _query: &str,
-            _embedding: &[f32],
-            limit: usize,
-            _rrf_k: u32,
-        ) -> Result<Vec<RankedResult>> {
-            if let Some(message) = &self.hybrid_error {
-                return Err(TruesightError::Database(message.clone()));
-            }
-
-            Ok(self.hybrid_results.iter().take(limit).cloned().collect())
-        }
-
-        async fn get_index_metadata(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-        ) -> Result<Option<IndexMetadata>> {
-            unreachable!("index metadata is not used in search tests")
-        }
-
-        async fn set_index_metadata(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-            _meta: &IndexMetadata,
-        ) -> Result<()> {
-            unreachable!("index metadata is not used in search tests")
-        }
-
-        async fn has_indexed_symbols(&self, _repo_id: &str, _branch: &str) -> Result<bool> {
-            unreachable!("indexed symbol checks are not used in search tests")
-        }
-
-        async fn delete_branch_index(&self, _repo_id: &str, _branch: &str) -> Result<()> {
-            unreachable!("delete is not used in search tests")
-        }
-
-        async fn get_all_symbols(
-            &self,
-            _repo_id: &str,
-            _branch: &str,
-        ) -> Result<Vec<truesight_core::CodeUnit>> {
-            unreachable!("listing symbols is not used in search tests")
-        }
+    fn expect_vector_results(storage: &mut MockStorage, results: Vec<RankedResult>) {
+        storage
+            .expect_search_vector()
+            .times(1)
+            .returning(move |_, _, _, limit| Ok(results.iter().take(limit).cloned().collect()));
     }
 
-    struct FakeEmbedder {
-        embedding: Vec<f32>,
-        error: Option<String>,
-        dimension: usize,
+    fn expect_hybrid_results(storage: &mut MockStorage, results: Vec<RankedResult>) {
+        storage
+            .expect_search_hybrid()
+            .times(1)
+            .returning(move |_, _, _, _, limit, _| {
+                Ok(results.iter().take(limit).cloned().collect())
+            });
     }
 
-    impl Embedder for FakeEmbedder {
-        fn embed(&self, _text: &str) -> Result<Vec<f32>> {
-            if let Some(message) = &self.error {
-                return Err(TruesightError::Embedding(message.clone()));
-            }
+    fn expect_hybrid_error(storage: &mut MockStorage, message: &str) {
+        let message = message.to_string();
+        storage
+            .expect_search_hybrid()
+            .times(1)
+            .returning(move |_, _, _, _, _, _| Err(TruesightError::Database(message.clone())));
+    }
 
-            Ok(self.embedding.clone())
-        }
+    fn expect_embedder_success(embedder: &mut MockEmbedder, embedding: Vec<f32>) {
+        embedder
+            .expect_embed()
+            .times(1)
+            .returning(move |_| Ok(embedding.clone()));
+    }
 
-        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-            texts.iter().map(|_| self.embed("")).collect()
-        }
-
-        fn dimension(&self) -> usize {
-            self.dimension
-        }
+    fn expect_embedder_error(embedder: &mut MockEmbedder, message: &str) {
+        let message = message.to_string();
+        embedder
+            .expect_embed()
+            .times(1)
+            .returning(move |_| Err(TruesightError::Embedding(message.clone())));
     }
 
     #[tokio::test]
     async fn lexical_only_search_returns_ranked_fts_results() {
-        let storage = FakeStorage {
-            fts_results: vec![fts_result(
+        let mut storage = MockStorage::new();
+        expect_fts_results(
+            &mut storage,
+            vec![fts_result(
                 sample_unit("AuthService", "src/auth.rs", 8),
                 0.8,
             )],
-            vector_results: Vec::new(),
-            hybrid_results: Vec::new(),
-            vector_error: None,
-            hybrid_error: None,
-        };
+        );
         let config = SearchConfig {
             limit: 5,
             rrf_k: 60,
@@ -400,21 +326,16 @@ mod tests {
 
     #[tokio::test]
     async fn vector_assisted_search_returns_vector_results_when_fts_is_disabled() {
-        let storage = FakeStorage {
-            fts_results: Vec::new(),
-            vector_results: vec![vector_result(
+        let mut storage = MockStorage::new();
+        expect_vector_results(
+            &mut storage,
+            vec![vector_result(
                 sample_unit("semantic_retry", "src/retry.rs", 14),
                 0.93,
             )],
-            hybrid_results: Vec::new(),
-            vector_error: None,
-            hybrid_error: None,
-        };
-        let embedder = FakeEmbedder {
-            embedding: vec![0.4, 0.6, 0.2],
-            error: None,
-            dimension: 3,
-        };
+        );
+        let mut embedder = MockEmbedder::new();
+        expect_embedder_success(&mut embedder, vec![0.4, 0.6, 0.2]);
         let config = SearchConfig {
             limit: 5,
             rrf_k: 60,
@@ -436,27 +357,19 @@ mod tests {
 
     #[tokio::test]
     async fn hybrid_search_uses_db_fused_results_on_happy_path() {
-        let storage = FakeStorage {
-            fts_results: vec![fts_result(sample_unit("fts_only", "src/fts.rs", 4), 0.9)],
-            vector_results: vec![vector_result(
-                sample_unit("vector_only", "src/vector.rs", 9),
-                0.94,
-            )],
-            hybrid_results: vec![RankedResult {
+        let mut storage = MockStorage::new();
+        expect_hybrid_results(
+            &mut storage,
+            vec![RankedResult {
                 unit: sample_unit("retry_job", "src/retry.rs", 22),
                 fts_score: Some(0.4),
                 vector_score: Some(0.5),
                 combined_score: 0.9,
                 match_type: MatchType::Hybrid,
             }],
-            vector_error: None,
-            hybrid_error: None,
-        };
-        let embedder = FakeEmbedder {
-            embedding: vec![0.2, 0.4, 0.6],
-            error: None,
-            dimension: 3,
-        };
+        );
+        let mut embedder = MockEmbedder::new();
+        expect_embedder_success(&mut embedder, vec![0.2, 0.4, 0.6]);
 
         let results = SearchEngine::new(&storage, Some(&embedder))
             .search(
@@ -476,10 +389,10 @@ mod tests {
 
     #[tokio::test]
     async fn hybrid_search_preserves_storage_ordering_and_match_types() {
-        let storage = FakeStorage {
-            fts_results: Vec::new(),
-            vector_results: Vec::new(),
-            hybrid_results: vec![
+        let mut storage = MockStorage::new();
+        expect_hybrid_results(
+            &mut storage,
+            vec![
                 RankedResult {
                     unit: sample_unit("retry_job", "src/retry.rs", 22),
                     fts_score: Some(0.4),
@@ -502,14 +415,9 @@ mod tests {
                     match_type: MatchType::Vector,
                 },
             ],
-            vector_error: None,
-            hybrid_error: None,
-        };
-        let embedder = FakeEmbedder {
-            embedding: vec![0.2, 0.4, 0.6],
-            error: None,
-            dimension: 3,
-        };
+        );
+        let mut embedder = MockEmbedder::new();
+        expect_embedder_success(&mut embedder, vec![0.2, 0.4, 0.6]);
 
         let results = SearchEngine::new(&storage, Some(&embedder))
             .search("retry auth", "/repo", "main", &SearchConfig::default())
@@ -527,10 +435,10 @@ mod tests {
 
     #[tokio::test]
     async fn hybrid_search_applies_min_score_and_limit_from_storage_scores() {
-        let storage = FakeStorage {
-            fts_results: Vec::new(),
-            vector_results: Vec::new(),
-            hybrid_results: vec![
+        let mut storage = MockStorage::new();
+        expect_hybrid_results(
+            &mut storage,
+            vec![
                 RankedResult {
                     unit: sample_unit("first", "src/first.rs", 1),
                     fts_score: Some(0.5),
@@ -546,14 +454,9 @@ mod tests {
                     match_type: MatchType::Fts,
                 },
             ],
-            vector_error: None,
-            hybrid_error: None,
-        };
-        let embedder = FakeEmbedder {
-            embedding: vec![0.2, 0.4, 0.6],
-            error: None,
-            dimension: 3,
-        };
+        );
+        let mut embedder = MockEmbedder::new();
+        expect_embedder_success(&mut embedder, vec![0.2, 0.4, 0.6]);
         let config = SearchConfig {
             limit: 1,
             rrf_k: 60,
@@ -574,21 +477,13 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_mode_returns_fts_results_when_embedder_fails() {
-        let storage = FakeStorage {
-            fts_results: vec![fts_result(sample_unit("User", "src/user.rs", 3), 0.88)],
-            vector_results: vec![vector_result(
-                sample_unit("semantic_user", "src/user_semantic.rs", 12),
-                0.91,
-            )],
-            hybrid_results: Vec::new(),
-            vector_error: None,
-            hybrid_error: None,
-        };
-        let failing_embedder = FakeEmbedder {
-            embedding: Vec::new(),
-            error: Some("model unavailable".to_string()),
-            dimension: 3,
-        };
+        let mut storage = MockStorage::new();
+        expect_fts_results(
+            &mut storage,
+            vec![fts_result(sample_unit("User", "src/user.rs", 3), 0.88)],
+        );
+        let mut failing_embedder = MockEmbedder::new();
+        expect_embedder_error(&mut failing_embedder, "model unavailable");
         let config = SearchConfig::default();
 
         let results = search(
@@ -609,16 +504,11 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_mode_returns_fts_results_when_no_embedder_is_configured() {
-        let storage = FakeStorage {
-            fts_results: vec![fts_result(sample_unit("User", "src/user.rs", 3), 0.88)],
-            vector_results: vec![vector_result(
-                sample_unit("semantic_user", "src/user_semantic.rs", 12),
-                0.91,
-            )],
-            hybrid_results: Vec::new(),
-            vector_error: None,
-            hybrid_error: None,
-        };
+        let mut storage = MockStorage::new();
+        expect_fts_results(
+            &mut storage,
+            vec![fts_result(sample_unit("User", "src/user.rs", 3), 0.88)],
+        );
 
         let results = search(
             "user model",
@@ -638,24 +528,17 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_mode_returns_fts_results_when_vector_lookup_fails() {
-        let storage = FakeStorage {
-            fts_results: vec![fts_result(
+        let mut storage = MockStorage::new();
+        expect_hybrid_error(&mut storage, "vector index unavailable");
+        expect_fts_results(
+            &mut storage,
+            vec![fts_result(
                 sample_unit("AuthService", "src/auth.rs", 8),
                 0.8,
             )],
-            vector_results: vec![vector_result(
-                sample_unit("semantic_auth", "src/semantic.rs", 15),
-                0.93,
-            )],
-            hybrid_results: Vec::new(),
-            vector_error: Some("vector index unavailable".to_string()),
-            hybrid_error: Some("vector index unavailable".to_string()),
-        };
-        let embedder = FakeEmbedder {
-            embedding: vec![0.4, 0.6, 0.2],
-            error: None,
-            dimension: 3,
-        };
+        );
+        let mut embedder = MockEmbedder::new();
+        expect_embedder_success(&mut embedder, vec![0.4, 0.6, 0.2]);
 
         let results = search(
             "authentication",
@@ -675,24 +558,16 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_mode_returns_vector_results_when_fts_is_empty() {
-        let storage = FakeStorage {
-            fts_results: Vec::new(),
-            vector_results: vec![vector_result(
+        let mut storage = MockStorage::new();
+        expect_hybrid_results(
+            &mut storage,
+            vec![vector_result(
                 sample_unit("RetryPolicy", "src/retry.rs", 19),
                 0.97,
             )],
-            hybrid_results: vec![vector_result(
-                sample_unit("RetryPolicy", "src/retry.rs", 19),
-                0.97,
-            )],
-            vector_error: None,
-            hybrid_error: None,
-        };
-        let embedder = FakeEmbedder {
-            embedding: vec![0.1, 0.2, 0.3],
-            error: None,
-            dimension: 3,
-        };
+        );
+        let mut embedder = MockEmbedder::new();
+        expect_embedder_success(&mut embedder, vec![0.1, 0.2, 0.3]);
         let config = SearchConfig::default();
 
         let results = search(

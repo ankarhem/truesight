@@ -115,7 +115,7 @@ mod tests {
             Ok(vec![text.len() as f32])
         }
 
-        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        fn embed_batch<'a>(&self, texts: &[&'a str]) -> Result<Vec<Vec<f32>>> {
             texts.iter().map(|text| self.embed(text)).collect()
         }
 
