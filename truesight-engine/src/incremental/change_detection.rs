@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+use rayon::prelude::*;
 use truesight_core::{IncrementalStorage, Result};
 
 use super::ChangeSet;
@@ -35,13 +36,17 @@ pub(super) async fn detect_hash_changes<S: IncrementalStorage + ?Sized>(
         .into_iter()
         .map(|record| (record.file_path, record.file_hash))
         .collect::<HashMap<_, _>>();
-    let mut current_hashes = HashMap::new();
-
-    for discovered in walker.walk(root)? {
-        let relative_path = repo_relative_path(root, &discovered.path)?;
-        let file_hash = hash_file(&discovered.path)?;
-        current_hashes.insert(relative_path, file_hash);
-    }
+    let current_hashes = walker
+        .walk(root)?
+        .into_par_iter()
+        .map(|discovered| {
+            let relative_path = repo_relative_path(root, &discovered.path)?;
+            let file_hash = hash_file(&discovered.path)?;
+            Ok((relative_path, file_hash))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<HashMap<_, _>>>()?;
 
     let mut changes = ChangeSet::default();
 

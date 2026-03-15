@@ -3,9 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use truesight_core::{
-    Embedder, IncrementalStorage, IndexMetadata, IndexStats, IndexStatus, Language, Result,
-    TruesightError,
+    Embedder, IncrementalStorage, IndexMetadata, IndexStats, IndexStatus, IndexedCodeUnit,
+    IndexedFileRecord, Language, Result, TruesightError,
 };
 
 use crate::indexing::{build_pending_units, materialize_embeddings};
@@ -43,6 +44,13 @@ struct IndexAccumulators {
     languages: HashMap<Language, u32>,
     symbols_extracted: u32,
     chunks_embedded: u32,
+}
+
+struct PreparedFileUpdate {
+    path: PathBuf,
+    language: Language,
+    file_hash: String,
+    units: Vec<IndexedCodeUnit>,
 }
 
 struct IndexContext<'a, S: IncrementalStorage + ?Sized, E: Embedder + ?Sized> {
@@ -124,35 +132,50 @@ impl IncrementalIndexer {
             chunks_embedded: 0,
         };
 
-        for deleted in &changes.deleted {
-            ctx.storage
-                .delete_units_for_file(ctx.repo_id, ctx.branch, deleted)
-                .await?;
-            ctx.storage
-                .delete_indexed_file(ctx.repo_id, ctx.branch, deleted)
-                .await?;
+        let existing_indexed_files = ctx
+            .storage
+            .get_indexed_files(ctx.repo_id, ctx.branch)
+            .await?;
+        let deleted_or_replaced_files = changes
+            .deleted
+            .iter()
+            .chain(changes.modified.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let prepared_files = prepare_file_updates(ctx.root, &changes.modified, &changes.added)?;
+        let mut stored_units = Vec::new();
+        let mut indexed_files = Vec::with_capacity(prepared_files.len());
+
+        for file in prepared_files {
+            *accumulators.languages.entry(file.language).or_insert(0) += 1;
+            accumulators.symbols_extracted += file.units.len() as u32;
+            indexed_files.push(IndexedFileRecord {
+                file_path: file.path,
+                file_hash: file.file_hash,
+                chunk_count: file.units.len() as u32,
+                indexed_at: chrono::Utc::now(),
+            });
+            stored_units.extend(file.units);
         }
 
-        for modified in &changes.modified {
-            ctx.storage
-                .delete_units_for_file(ctx.repo_id, ctx.branch, modified)
-                .await?;
-            self.index_one_file(&ctx, modified, &mut accumulators)
-                .await?;
-        }
-
-        for added in &changes.added {
-            self.index_one_file(&ctx, added, &mut accumulators).await?;
-        }
+        ctx.storage
+            .apply_incremental_changes(
+                ctx.repo_id,
+                ctx.branch,
+                &deleted_or_replaced_files,
+                &stored_units,
+                &indexed_files,
+            )
+            .await?;
 
         accumulators.chunks_embedded =
             materialize_embeddings(ctx.storage, ctx.repo_id, ctx.branch, ctx.embedder).await?;
 
-        let all_symbols = ctx.storage.get_all_symbols(ctx.repo_id, ctx.branch).await?;
-        let indexed_files = ctx
-            .storage
-            .get_indexed_files(ctx.repo_id, ctx.branch)
-            .await?;
+        let final_indexed_files = updated_indexed_file_counts(
+            &existing_indexed_files,
+            &deleted_or_replaced_files,
+            &indexed_files,
+        );
         let current_sha = git::current_commit_sha(ctx.root).ok();
         let metadata = IndexMetadata {
             repo_id: ctx.repo_id.to_string(),
@@ -161,8 +184,8 @@ impl IncrementalIndexer {
             last_indexed_at: chrono::Utc::now(),
             last_commit_sha: current_sha.clone(),
             last_seen_commit_sha: current_sha,
-            file_count: indexed_files.len() as u32,
-            symbol_count: all_symbols.len() as u32,
+            file_count: final_indexed_files.len() as u32,
+            symbol_count: final_indexed_files.values().copied().sum(),
             embedding_model: ctx.embedder.model_name().to_string(),
             last_error: None,
         };
@@ -204,42 +227,64 @@ impl IncrementalIndexer {
             .await?;
         Ok((context, stats))
     }
+}
 
-    async fn index_one_file<S: IncrementalStorage + ?Sized, E: Embedder + ?Sized>(
-        &self,
-        ctx: &IndexContext<'_, S, E>,
-        relative_path: &Path,
-        accumulators: &mut IndexAccumulators,
-    ) -> Result<()> {
-        let absolute_path = ctx.root.join(relative_path);
-        let language = Language::from_path(relative_path).ok_or_else(|| {
-            TruesightError::Index(format!(
-                "unsupported language for {}",
-                relative_path.display()
-            ))
-        })?;
-        let source = fs::read(&absolute_path)?;
-        let file_hash = hash_bytes(&source);
-        let units = parse_file(relative_path, &source, language)?;
-        let stored_units = build_pending_units(units, &file_hash);
+fn prepare_file_updates(
+    root: &Path,
+    modified: &[PathBuf],
+    added: &[PathBuf],
+) -> Result<Vec<PreparedFileUpdate>> {
+    modified
+        .iter()
+        .chain(added.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|relative_path| process_file_update(root, relative_path))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect()
+}
 
-        ctx.storage
-            .store_indexed_units(ctx.repo_id, ctx.branch, &stored_units)
-            .await?;
-        ctx.storage
-            .upsert_indexed_file(
-                ctx.repo_id,
-                ctx.branch,
-                relative_path,
-                &file_hash,
-                stored_units.len() as u32,
-            )
-            .await?;
+fn process_file_update(root: &Path, relative_path: &Path) -> Result<PreparedFileUpdate> {
+    let absolute_path = root.join(relative_path);
+    let language = Language::from_path(relative_path).ok_or_else(|| {
+        TruesightError::Index(format!(
+            "unsupported language for {}",
+            relative_path.display()
+        ))
+    })?;
+    let source = fs::read(&absolute_path)?;
+    let file_hash = hash_bytes(&source);
+    let units = parse_file(relative_path, &source, language)?;
 
-        *accumulators.languages.entry(language).or_insert(0) += 1;
-        accumulators.symbols_extracted += stored_units.len() as u32;
-        Ok(())
+    Ok(PreparedFileUpdate {
+        path: relative_path.to_path_buf(),
+        language,
+        file_hash: file_hash.clone(),
+        units: build_pending_units(units, &file_hash),
+    })
+}
+
+fn updated_indexed_file_counts(
+    existing_indexed_files: &[IndexedFileRecord],
+    deleted_or_replaced_files: &[PathBuf],
+    indexed_files: &[IndexedFileRecord],
+) -> HashMap<PathBuf, u32> {
+    let mut file_counts = existing_indexed_files
+        .iter()
+        .map(|record| (record.file_path.clone(), record.chunk_count))
+        .collect::<HashMap<_, _>>();
+
+    for file_path in deleted_or_replaced_files {
+        file_counts.remove(file_path);
     }
+
+    for file in indexed_files {
+        file_counts.insert(file.file_path.clone(), file.chunk_count);
+    }
+
+    file_counts
 }
 
 #[cfg(test)]
@@ -587,6 +632,11 @@ mod tests {
             .get_all_symbols(&context.repo_id, &context.branch)
             .await
             .unwrap();
+        let metadata = database
+            .get_index_metadata(&context.repo_id, &context.branch)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(stats.files_indexed, 1);
         assert_eq!(stats.files_scanned, 1);
@@ -595,6 +645,85 @@ mod tests {
         assert!(stored.iter().any(|unit| unit.name == "alpha_v2"));
         assert!(stored.iter().any(|unit| unit.name == "beta"));
         assert!(!stored.iter().any(|unit| unit.name == "alpha"));
+        assert_eq!(metadata.file_count, 2);
+        assert_eq!(metadata.symbol_count, 2);
+    }
+
+    #[tokio::test]
+    async fn incremental_index_updates_metadata_when_modified_file_loses_symbols() {
+        let temp = git_repo();
+        write_file(
+            temp.path(),
+            "src/lib.rs",
+            "pub fn alpha() -> bool { true }\n",
+        );
+        write_file(
+            temp.path(),
+            "src/utils.rs",
+            "pub fn beta() -> bool { false }\n",
+        );
+        git::git_commit_all(temp.path(), "initial");
+
+        let database = TestStorage::default();
+        let indexer = IncrementalIndexer::new();
+        let embedder = FakeEmbedder;
+        let context = detect_repo_context(temp.path()).expect("repo context should resolve");
+
+        let initial_changes = indexer
+            .detect_changes(temp.path(), &database, &context.repo_id, &context.branch)
+            .await
+            .unwrap();
+        indexer
+            .incremental_index(
+                temp.path(),
+                &initial_changes,
+                &database,
+                &embedder,
+                &context.repo_id,
+                &context.branch,
+            )
+            .await
+            .unwrap();
+
+        write_file(temp.path(), "src/lib.rs", "fn alpha() -> bool { true }\n");
+        git::git_commit_all(temp.path(), "hide alpha");
+
+        let changes = indexer
+            .detect_changes(temp.path(), &database, &context.repo_id, &context.branch)
+            .await
+            .unwrap();
+        indexer
+            .incremental_index(
+                temp.path(),
+                &changes,
+                &database,
+                &embedder,
+                &context.repo_id,
+                &context.branch,
+            )
+            .await
+            .unwrap();
+
+        let metadata = database
+            .get_index_metadata(&context.repo_id, &context.branch)
+            .await
+            .unwrap()
+            .unwrap();
+        let indexed_files = database
+            .get_indexed_files(&context.repo_id, &context.branch)
+            .await
+            .unwrap();
+
+        assert_eq!(metadata.file_count, 2);
+        assert_eq!(metadata.symbol_count, 1);
+        assert_eq!(indexed_files.len(), 2);
+        assert_eq!(
+            indexed_files
+                .iter()
+                .find(|file| file.file_path == PathBuf::from("src/lib.rs"))
+                .map(|file| file.chunk_count),
+            Some(0)
+        );
     }
 
     #[tokio::test]
@@ -662,11 +791,18 @@ mod tests {
             .get_indexed_files(&context.repo_id, &context.branch)
             .await
             .unwrap();
+        let metadata = database
+            .get_index_metadata(&context.repo_id, &context.branch)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].name, "alpha");
         assert_eq!(indexed_files.len(), 1);
         assert_eq!(indexed_files[0].file_path, PathBuf::from("src/lib.rs"));
+        assert_eq!(metadata.file_count, 1);
+        assert_eq!(metadata.symbol_count, 1);
     }
 
     #[tokio::test]
