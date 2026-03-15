@@ -50,9 +50,8 @@ impl AppServices {
         full: bool,
     ) -> anyhow::Result<IndexRepoResponse> {
         let _marker = runtime::acquire_indexing_marker(&repo_root).await?;
-        let context = detect_repo_context_from_root(&repo_root)?;
-        let database = open_database(&repo_root).await?;
-        let embedder = OnnxEmbedder::new().context("failed to initialize embedder")?;
+        let ((context, database), embedder) =
+            tokio::try_join!(prepare_context_and_database(&repo_root), load_embedder(),)?;
 
         database
             .update_index_status(
@@ -176,7 +175,7 @@ impl AppServices {
         query: String,
         limit: usize,
     ) -> anyhow::Result<SearchRepoResponse> {
-        let embedder = OnnxEmbedder::new().context("failed to initialize embedder")?;
+        let embedder = load_embedder().await?;
         let search_engine = SearchEngine::new(&database, Some(&embedder));
         let config = SearchConfig {
             limit,
@@ -204,8 +203,7 @@ impl AppServices {
         for attempt in 0..=SEARCH_RETRY_ATTEMPTS {
             wait_for_indexing_marker(&repo_root).await?;
 
-            let context = detect_repo_context_from_root(&repo_root)?;
-            let database = open_database(&repo_root).await?;
+            let (context, database) = prepare_context_and_database(&repo_root).await?;
             let result = async {
                 let metadata =
                     Storage::get_index_metadata(&database, &context.repo_id, &context.branch)
@@ -254,8 +252,7 @@ impl AppServices {
         for attempt in 0..=SEARCH_RETRY_ATTEMPTS {
             wait_for_indexing_marker(&repo_root).await?;
 
-            let context = detect_repo_context_from_root(&repo_root)?;
-            let database = open_database(&repo_root).await?;
+            let (context, database) = prepare_context_and_database(&repo_root).await?;
             let result = async {
                 let metadata =
                     Storage::get_index_metadata(&database, &context.repo_id, &context.branch)
@@ -292,6 +289,28 @@ impl AppServices {
             repo_root.display()
         ))
     }
+}
+
+async fn prepare_context_and_database(
+    repo_root: &PathBuf,
+) -> anyhow::Result<(RepoContext, Database)> {
+    let repo_root_for_context = repo_root.clone();
+    let context_task =
+        tokio::task::spawn_blocking(move || detect_repo_context_from_root(&repo_root_for_context));
+
+    let database = open_database(repo_root).await?;
+    let context = context_task
+        .await
+        .map_err(|error| anyhow!("repo context task failed: {error}"))??;
+
+    Ok((context, database))
+}
+
+async fn load_embedder() -> anyhow::Result<OnnxEmbedder> {
+    tokio::task::spawn_blocking(OnnxEmbedder::new)
+        .await
+        .map_err(|error| anyhow!("embedder task failed: {error}"))?
+        .context("failed to initialize embedder")
 }
 
 pub(crate) async fn run(cli: Cli, writer: &mut dyn Write) -> anyhow::Result<()> {
