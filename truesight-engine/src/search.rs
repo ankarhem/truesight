@@ -68,99 +68,126 @@ pub async fn search(
     embedder: Option<&dyn Embedder>,
     config: &SearchConfig,
 ) -> Result<Vec<SearchResult>> {
-    let pre_fusion_limit = pre_fusion_limit(config.limit);
-
     if config.use_fts && config.use_vector {
-        let Some(embedder) = embedder else {
-            warn!(
-                repo_id,
-                branch, query, "no embedder configured; degrading search"
-            );
-            let fts_results = storage
-                .search_fts(repo_id, branch, query, pre_fusion_limit)
-                .await?;
-            return Ok(ranked_results_to_search_results(fts_results, config));
-        };
-
-        let embedding = match embedder.embed(query) {
-            Ok(embedding) => embedding,
-            Err(error) => {
-                warn!(
-                    repo_id,
-                    branch, query, "query embedding unavailable; degrading search: {error}"
-                );
-                let fts_results = storage
-                    .search_fts(repo_id, branch, query, pre_fusion_limit)
-                    .await?;
-                return Ok(ranked_results_to_search_results(fts_results, config));
-            }
-        };
-
-        return match storage
-            .search_hybrid(
-                repo_id,
-                branch,
-                query,
-                &embedding,
-                config.limit,
-                config.rrf_k,
-            )
-            .await
-        {
-            Ok(results) => Ok(ranked_results_to_search_results(results, config)),
-            Err(error) => {
-                warn!(
-                    repo_id,
-                    branch, query, "hybrid search degraded to lexical-only mode: {error}"
-                );
-                let fts_results = storage
-                    .search_fts(repo_id, branch, query, pre_fusion_limit)
-                    .await?;
-                Ok(ranked_results_to_search_results(fts_results, config))
-            }
-        };
+        return search_hybrid_or_lexical(query, repo_id, branch, storage, embedder, config).await;
     }
 
     if config.use_fts {
-        let fts_results = storage
-            .search_fts(repo_id, branch, query, pre_fusion_limit)
-            .await?;
-        return Ok(ranked_results_to_search_results(fts_results, config));
+        return search_lexical(query, repo_id, branch, storage, config).await;
     }
 
     if config.use_vector {
-        let vector_results = match embedder {
-            Some(embedder) => match embedder.embed(query) {
-                Ok(embedding) => storage
-                    .search_vector(repo_id, branch, &embedding, pre_fusion_limit)
-                    .await
-                    .unwrap_or_else(|error| {
-                        warn!(
-                            repo_id,
-                            branch, query, "vector search degraded to empty mode: {error}"
-                        );
-                        Vec::new()
-                    }),
-                Err(error) => {
-                    warn!(
-                        repo_id,
-                        branch, query, "query embedding unavailable; degrading search: {error}"
-                    );
-                    Vec::new()
-                }
-            },
-            None => {
-                warn!(
-                    repo_id,
-                    branch, query, "no embedder configured; degrading search"
-                );
-                Vec::new()
-            }
-        };
-        return Ok(ranked_results_to_search_results(vector_results, config));
+        return search_vector_only(query, repo_id, branch, storage, embedder, config).await;
     }
 
     Ok(Vec::new())
+}
+
+async fn search_hybrid_or_lexical(
+    query: &str,
+    repo_id: &str,
+    branch: &str,
+    storage: &dyn Storage,
+    embedder: Option<&dyn Embedder>,
+    config: &SearchConfig,
+) -> Result<Vec<SearchResult>> {
+    let Some(embedder) = embedder else {
+        warn!(
+            repo_id,
+            branch, query, "no embedder configured; degrading search"
+        );
+        return search_lexical(query, repo_id, branch, storage, config).await;
+    };
+
+    let Some(embedding) = query_embedding(query, repo_id, branch, embedder) else {
+        return search_lexical(query, repo_id, branch, storage, config).await;
+    };
+
+    match storage
+        .search_hybrid(
+            repo_id,
+            branch,
+            query,
+            &embedding,
+            config.limit,
+            config.rrf_k,
+        )
+        .await
+    {
+        Ok(results) => Ok(ranked_results_to_search_results(results, config)),
+        Err(error) => {
+            warn!(
+                repo_id,
+                branch, query, "hybrid search degraded to lexical-only mode: {error}"
+            );
+            search_lexical(query, repo_id, branch, storage, config).await
+        }
+    }
+}
+
+async fn search_lexical(
+    query: &str,
+    repo_id: &str,
+    branch: &str,
+    storage: &dyn Storage,
+    config: &SearchConfig,
+) -> Result<Vec<SearchResult>> {
+    let fts_results = storage
+        .search_fts(repo_id, branch, query, pre_fusion_limit(config.limit))
+        .await?;
+    Ok(ranked_results_to_search_results(fts_results, config))
+}
+
+async fn search_vector_only(
+    query: &str,
+    repo_id: &str,
+    branch: &str,
+    storage: &dyn Storage,
+    embedder: Option<&dyn Embedder>,
+    config: &SearchConfig,
+) -> Result<Vec<SearchResult>> {
+    let Some(embedder) = embedder else {
+        warn!(
+            repo_id,
+            branch, query, "no embedder configured; degrading search"
+        );
+        return Ok(Vec::new());
+    };
+
+    let Some(embedding) = query_embedding(query, repo_id, branch, embedder) else {
+        return Ok(Vec::new());
+    };
+
+    let vector_results = storage
+        .search_vector(repo_id, branch, &embedding, pre_fusion_limit(config.limit))
+        .await
+        .unwrap_or_else(|error| {
+            warn!(
+                repo_id,
+                branch, query, "vector search degraded to empty mode: {error}"
+            );
+            Vec::new()
+        });
+
+    Ok(ranked_results_to_search_results(vector_results, config))
+}
+
+fn query_embedding(
+    query: &str,
+    repo_id: &str,
+    branch: &str,
+    embedder: &dyn Embedder,
+) -> Option<Vec<f32>> {
+    match embedder.embed(query) {
+        Ok(embedding) => Some(embedding),
+        Err(error) => {
+            warn!(
+                repo_id,
+                branch, query, "query embedding unavailable; degrading search: {error}"
+            );
+            None
+        }
+    }
 }
 
 fn ranked_results_to_search_results(
