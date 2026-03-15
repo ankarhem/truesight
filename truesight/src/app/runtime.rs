@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -16,15 +16,23 @@ const INDEXING_MARKER_STALE_SECS: u64 = 300;
 static REPO_OPERATION_LOCKS: OnceLock<
     tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 > = OnceLock::new();
+static MIGRATED_DATABASES: OnceLock<tokio::sync::Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 pub(super) async fn open_database(repo_root: &Path) -> Result<Database> {
     let db_path = Database::db_path_for_repo(repo_root)?;
     let database = Database::new(&db_path).await?;
 
+    if migrations_cached(&db_path).await && has_migration_table(&database).await? {
+        return Ok(database);
+    }
+
     let mut attempts = 0_u8;
     loop {
         match database.run_migrations().await {
-            Ok(()) => return Ok(database),
+            Ok(()) => {
+                mark_migrations_cached(db_path.clone()).await;
+                return Ok(database);
+            }
             Err(error) if error.to_string().contains("database is locked") && attempts < 20 => {
                 attempts += 1;
                 tokio::time::sleep(StdDuration::from_millis(100)).await;
@@ -32,6 +40,38 @@ pub(super) async fn open_database(repo_root: &Path) -> Result<Database> {
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+async fn migrations_cached(db_path: &Path) -> bool {
+    MIGRATED_DATABASES
+        .get_or_init(|| tokio::sync::Mutex::new(HashSet::new()))
+        .lock()
+        .await
+        .contains(db_path)
+}
+
+async fn mark_migrations_cached(db_path: PathBuf) {
+    MIGRATED_DATABASES
+        .get_or_init(|| tokio::sync::Mutex::new(HashSet::new()))
+        .lock()
+        .await
+        .insert(db_path);
+}
+
+async fn has_migration_table(database: &Database) -> Result<bool> {
+    let connection = database.connect().await?;
+    let mut rows = connection
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_migrations' LIMIT 1",
+            (),
+        )
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?;
+    Ok(rows
+        .next()
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?
+        .is_some())
 }
 
 pub(super) async fn branch_has_index(
