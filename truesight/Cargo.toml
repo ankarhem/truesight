@@ -20,4 +20,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 insta = "1"
+mockall = "0.13"
 tempfile = "3"

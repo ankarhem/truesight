@@ -19,6 +19,7 @@ use crate::app::{AppServices, IndexRepoResponse, IndexRepoStats, SearchRepoRespo
 
 type AppFuture<T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'static>>;
 
+#[cfg_attr(test, mockall::automock)]
 trait TruesightApp: Send + Sync {
     fn index_repo(&self, path: PathBuf, full: bool) -> AppFuture<IndexRepoResponse>;
     fn search_repo(
@@ -367,100 +368,96 @@ fn string_to_non_negative_integer_map_schema(_: &mut SchemaGenerator) -> Schema 
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
-    use std::pin::Pin;
-
     use super::*;
     use truesight_core::{CodeUnitKind, MatchType, ModuleInfo, SearchResult, SymbolInfo};
 
-    #[derive(Clone, Default)]
-    struct FakeApp;
-
-    impl TruesightApp for FakeApp {
-        fn index_repo(
-            &self,
-            path: PathBuf,
-            _full: bool,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<IndexRepoResponse>> + Send + 'static>>
-        {
-            Box::pin(async move {
-                Ok(IndexRepoResponse {
-                    status: String::from("completed"),
-                    repo_root: path,
-                    branch: String::from("main"),
-                    stats: IndexRepoStats {
-                        files_scanned: 2,
-                        files_indexed: 2,
-                        files_skipped: 0,
-                        symbols_extracted: 3,
-                        chunks_embedded: 3,
-                        duration_ms: 12,
-                    },
-                    languages: HashMap::from([(String::from("rust"), 2)]),
+    fn expect_index_repo(app: &mut MockTruesightApp) {
+        app.expect_index_repo()
+            .times(1)
+            .withf(|path, full| path == &PathBuf::from("/repo") && *full)
+            .returning(|path, _| {
+                Box::pin(async move {
+                    Ok(IndexRepoResponse {
+                        status: String::from("completed"),
+                        repo_root: path,
+                        branch: String::from("main"),
+                        stats: IndexRepoStats {
+                            files_scanned: 2,
+                            files_indexed: 2,
+                            files_skipped: 0,
+                            symbols_extracted: 3,
+                            chunks_embedded: 3,
+                            duration_ms: 12,
+                        },
+                        languages: HashMap::from([(String::from("rust"), 2)]),
+                    })
                 })
-            })
-        }
+            });
+    }
 
-        fn search_repo(
-            &self,
-            path: PathBuf,
-            query: String,
-            _limit: usize,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<SearchRepoResponse>> + Send + 'static>>
-        {
-            Box::pin(async move {
-                Ok(SearchRepoResponse {
-                    query,
-                    total_results: 1,
-                    results: vec![SearchResult {
-                        kind: CodeUnitKind::Function,
-                        name: String::from("retry_payment"),
-                        path,
-                        line: 23,
-                        signature: String::from("pub fn retry_payment() -> bool"),
-                        doc: Some(String::from("Retries failed payments.")),
-                        snippet: String::from("pub fn retry_payment() -> bool { true }"),
-                        score: 1.0,
-                        match_type: MatchType::Hybrid,
-                    }],
-                    search_mode: String::from("hybrid"),
-                    repo_root: PathBuf::from("/repo"),
-                    branch: String::from("main"),
-                })
+    fn expect_search_repo(app: &mut MockTruesightApp) {
+        app.expect_search_repo()
+            .times(1)
+            .withf(|path, query, limit| {
+                path == &PathBuf::from("src/retry.rs") && query == "retry" && *limit == 5
             })
-        }
-
-        fn repo_map(
-            &self,
-            path: PathBuf,
-            _filter: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<RepoMap>> + Send + 'static>> {
-            Box::pin(async move {
-                Ok(RepoMap {
-                    repo_root: path,
-                    branch: String::from("main"),
-                    modules: vec![ModuleInfo {
-                        name: String::from("src"),
-                        path: PathBuf::from("src"),
-                        files: vec![String::from("lib.rs")],
-                        symbols: vec![SymbolInfo {
-                            name: String::from("AuthService"),
-                            kind: CodeUnitKind::Struct,
-                            signature: String::from("pub struct AuthService"),
-                            doc: Some(String::from("Service.")),
-                            file: String::from("lib.rs"),
-                            line: 1,
+            .returning(|path, query, _| {
+                Box::pin(async move {
+                    Ok(SearchRepoResponse {
+                        query,
+                        total_results: 1,
+                        results: vec![SearchResult {
+                            kind: CodeUnitKind::Function,
+                            name: String::from("retry_payment"),
+                            path,
+                            line: 23,
+                            signature: String::from("pub fn retry_payment() -> bool"),
+                            doc: Some(String::from("Retries failed payments.")),
+                            snippet: String::from("pub fn retry_payment() -> bool { true }"),
+                            score: 1.0,
+                            match_type: MatchType::Hybrid,
                         }],
-                        depends_on: vec![],
-                    }],
+                        search_mode: String::from("hybrid"),
+                        repo_root: PathBuf::from("/repo"),
+                        branch: String::from("main"),
+                    })
                 })
+            });
+    }
+
+    fn expect_repo_map(app: &mut MockTruesightApp) {
+        app.expect_repo_map()
+            .times(1)
+            .withf(|path, filter| {
+                path == &PathBuf::from("/repo") && filter.as_deref() == Some("src")
             })
-        }
+            .returning(|path, _| {
+                Box::pin(async move {
+                    Ok(RepoMap {
+                        repo_root: path,
+                        branch: String::from("main"),
+                        modules: vec![ModuleInfo {
+                            name: String::from("src"),
+                            path: PathBuf::from("src"),
+                            files: vec![String::from("lib.rs")],
+                            symbols: vec![SymbolInfo {
+                                name: String::from("AuthService"),
+                                kind: CodeUnitKind::Struct,
+                                signature: String::from("pub struct AuthService"),
+                                doc: Some(String::from("Service.")),
+                                file: String::from("lib.rs"),
+                                line: 1,
+                            }],
+                            depends_on: vec![],
+                        }],
+                    })
+                })
+            });
     }
 
     #[test]
     fn tool_router_lists_exactly_three_planned_tools() {
-        let server = TruesightMcp::with_app(Arc::new(FakeApp));
+        let server = TruesightMcp::with_app(Arc::new(MockTruesightApp::new()));
         let mut names = server
             .tool_router
             .list_all()
@@ -474,7 +471,11 @@ mod tests {
 
     #[tokio::test]
     async fn tool_methods_return_structured_contract_data() {
-        let server = TruesightMcp::with_app(Arc::new(FakeApp));
+        let mut app = MockTruesightApp::new();
+        expect_index_repo(&mut app);
+        expect_search_repo(&mut app);
+        expect_repo_map(&mut app);
+        let server = TruesightMcp::with_app(Arc::new(app));
 
         let index_result = server
             .index_repo(Parameters(IndexRepoRequest {
@@ -514,7 +515,7 @@ mod tests {
 
     #[test]
     fn server_info_enables_tool_capabilities() {
-        let info = TruesightMcp::with_app(Arc::new(FakeApp)).get_info();
+        let info = TruesightMcp::with_app(Arc::new(MockTruesightApp::new())).get_info();
 
         assert!(info.capabilities.tools.is_some());
         assert!(info.instructions.unwrap_or_default().contains("index_repo"));

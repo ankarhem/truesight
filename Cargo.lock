@@ -3495,6 +3495,7 @@ dependencies = [
  "chrono",
  "clap",
  "insta",
+ "mockall",
  "rmcp",
  "schemars 1.2.1",
  "serde",
