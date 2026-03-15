@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, anyhow};
@@ -200,47 +202,35 @@ impl AppServices {
         &self,
         repo_root: PathBuf,
     ) -> anyhow::Result<(PathBuf, RepoContext, Database)> {
-        for attempt in 0..=SEARCH_RETRY_ATTEMPTS {
-            wait_for_indexing_marker(&repo_root).await?;
+        retry_repo_operation(
+            &repo_root,
+            format!("timed out preparing index for {}", repo_root.display()),
+            |repo_root, context, database| {
+                Box::pin(async move {
+                    let metadata =
+                        Storage::get_index_metadata(&database, &context.repo_id, &context.branch)
+                            .await?;
 
-            let (context, database) = prepare_context_and_database(&repo_root).await?;
-            let result = async {
-                let metadata =
-                    Storage::get_index_metadata(&database, &context.repo_id, &context.branch)
-                        .await?;
+                    let should_reindex = match metadata.as_ref() {
+                        Some(metadata) => {
+                            should_refresh_index(metadata, context.last_commit_sha.as_deref())
+                        }
+                        None => {
+                            !branch_has_index(&database, &context.repo_id, &context.branch).await?
+                        }
+                    };
 
-                let should_reindex = match metadata.as_ref() {
-                    Some(metadata) => {
-                        should_refresh_index(metadata, context.last_commit_sha.as_deref())
+                    if should_reindex {
+                        let _ = self
+                            .index_repo_response_from_root(repo_root.clone(), false)
+                            .await?;
                     }
-                    None => !branch_has_index(&database, &context.repo_id, &context.branch).await?,
-                };
 
-                if should_reindex {
-                    let _ = self
-                        .index_repo_response_from_root(repo_root.clone(), false)
-                        .await?;
-                }
-
-                Ok::<_, anyhow::Error>((repo_root.clone(), context, database))
-            }
-            .await;
-
-            match result {
-                Ok(ready) => return Ok(ready),
-                Err(error)
-                    if should_retry_repo_operation(&error) && attempt < SEARCH_RETRY_ATTEMPTS =>
-                {
-                    tokio::time::sleep(StdDuration::from_millis(INDEXING_WAIT_INTERVAL_MS)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Err(anyhow!(
-            "timed out preparing index for {}",
-            repo_root.display()
-        ))
+                    Ok::<_, anyhow::Error>((repo_root.clone(), context, database))
+                })
+            },
+        )
+        .await
     }
 
     async fn search_repo_for_cli_from_root(
@@ -249,46 +239,66 @@ impl AppServices {
         query: String,
         limit: usize,
     ) -> anyhow::Result<SearchRepoResponse> {
-        for attempt in 0..=SEARCH_RETRY_ATTEMPTS {
-            wait_for_indexing_marker(&repo_root).await?;
+        retry_repo_operation(
+            &repo_root,
+            format!(
+                "timed out searching while index was being prepared for {}",
+                repo_root.display()
+            ),
+            |repo_root, context, database| {
+                let query = query.clone();
+                Box::pin(async move {
+                    let metadata =
+                        Storage::get_index_metadata(&database, &context.repo_id, &context.branch)
+                            .await?;
 
-            let (context, database) = prepare_context_and_database(&repo_root).await?;
-            let result = async {
-                let metadata =
-                    Storage::get_index_metadata(&database, &context.repo_id, &context.branch)
-                        .await?;
-
-                if metadata.is_none()
-                    && !branch_has_index(&database, &context.repo_id, &context.branch).await?
-                {
-                    return Err(anyhow!(
+                    if metadata.is_none()
+                        && !branch_has_index(&database, &context.repo_id, &context.branch).await?
+                    {
+                        return Err(anyhow!(
                         "repository is not indexed for branch `{}`; run `truesight index {}` first",
                         context.branch,
                         repo_root.display()
                     ));
-                }
+                    }
 
-                self.execute_search(repo_root.clone(), context, database, query.clone(), limit)
-                    .await
-            }
-            .await;
-
-            match result {
-                Ok(response) => return Ok(response),
-                Err(error)
-                    if should_retry_repo_operation(&error) && attempt < SEARCH_RETRY_ATTEMPTS =>
-                {
-                    tokio::time::sleep(StdDuration::from_millis(INDEXING_WAIT_INTERVAL_MS)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Err(anyhow!(
-            "timed out searching while index was being prepared for {}",
-            repo_root.display()
-        ))
+                    self.execute_search(repo_root.clone(), context, database, query.clone(), limit)
+                        .await
+                })
+            },
+        )
+        .await
     }
+}
+
+type RetryFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
+
+async fn retry_repo_operation<'a, T, F>(
+    repo_root: &'a PathBuf,
+    timeout_message: String,
+    mut operation: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut(PathBuf, RepoContext, Database) -> RetryFuture<'a, T>,
+{
+    for attempt in 0..=SEARCH_RETRY_ATTEMPTS {
+        wait_for_indexing_marker(repo_root).await?;
+
+        let (context, database) = prepare_context_and_database(repo_root).await?;
+        let result = operation(repo_root.clone(), context, database).await;
+
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if should_retry_repo_operation(&error) && attempt < SEARCH_RETRY_ATTEMPTS =>
+            {
+                tokio::time::sleep(StdDuration::from_millis(INDEXING_WAIT_INTERVAL_MS)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(anyhow!(timeout_message))
 }
 
 async fn prepare_context_and_database(
