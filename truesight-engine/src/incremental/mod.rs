@@ -1,7 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 use truesight_core::{
@@ -9,11 +8,14 @@ use truesight_core::{
     TruesightError,
 };
 
-use crate::indexing::{build_pending_units, materialize_embeddings, repo_relative_path};
+use crate::indexing::{build_pending_units, materialize_embeddings};
 use crate::parser::parse_file;
 use crate::repo_context::{RepoContext, detect_repo_context};
 use crate::util::hash_bytes;
 use crate::walker::FileWalker;
+
+mod change_detection;
+mod git;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChangeSet {
@@ -72,20 +74,19 @@ impl IncrementalIndexer {
     ) -> Result<ChangeSet> {
         let metadata = storage.get_index_metadata(repo_id, branch).await?;
         if metadata.is_none() {
-            return self.detect_initial_changes(root);
+            return change_detection::detect_initial_changes(&self.walker, root);
         }
 
         let metadata = metadata.expect("metadata checked above");
-        if is_git_repo(root) {
+        if git::is_git_repo(root) {
             if let Some(last_sha) = metadata.last_commit_sha.as_deref() {
-                if let Ok(changes) = git_changes(root, last_sha) {
+                if let Ok(changes) = git::git_changes(root, last_sha) {
                     return Ok(changes);
                 }
             }
         }
 
-        self.detect_hash_changes(root, storage, repo_id, branch)
-            .await
+        change_detection::detect_hash_changes(&self.walker, root, storage, repo_id, branch).await
     }
 
     pub async fn detect_changes_for_repo<S: IncrementalStorage + ?Sized>(
@@ -152,13 +153,14 @@ impl IncrementalIndexer {
             .storage
             .get_indexed_files(ctx.repo_id, ctx.branch)
             .await?;
+        let current_sha = git::current_commit_sha(ctx.root).ok();
         let metadata = IndexMetadata {
             repo_id: ctx.repo_id.to_string(),
             branch: ctx.branch.to_string(),
             status: IndexStatus::Ready,
             last_indexed_at: chrono::Utc::now(),
-            last_commit_sha: current_commit_sha(ctx.root).ok(),
-            last_seen_commit_sha: current_commit_sha(ctx.root).ok(),
+            last_commit_sha: current_sha.clone(),
+            last_seen_commit_sha: current_sha,
             file_count: indexed_files.len() as u32,
             symbol_count: all_symbols.len() as u32,
             embedding_model: ctx.embedder.model_name().to_string(),
@@ -203,64 +205,6 @@ impl IncrementalIndexer {
         Ok((context, stats))
     }
 
-    fn detect_initial_changes(&self, root: &Path) -> Result<ChangeSet> {
-        let mut changes = ChangeSet {
-            added: self
-                .walker
-                .walk(root)?
-                .into_iter()
-                .map(|file| repo_relative_path(root, &file.path))
-                .collect::<Result<Vec<_>>>()?,
-            modified: Vec::new(),
-            deleted: Vec::new(),
-        };
-        changes.normalize();
-        Ok(changes)
-    }
-
-    async fn detect_hash_changes<S: IncrementalStorage + ?Sized>(
-        &self,
-        root: &Path,
-        storage: &S,
-        repo_id: &str,
-        branch: &str,
-    ) -> Result<ChangeSet> {
-        let indexed = storage.get_indexed_files(repo_id, branch).await?;
-        let indexed_by_path = indexed
-            .into_iter()
-            .map(|record| (record.file_path, record.file_hash))
-            .collect::<HashMap<_, _>>();
-        let mut current_hashes = HashMap::new();
-
-        for discovered in self.walker.walk(root)? {
-            let relative_path = repo_relative_path(root, &discovered.path)?;
-            let file_hash = hash_file(&discovered.path)?;
-            current_hashes.insert(relative_path, file_hash);
-        }
-
-        let mut changes = ChangeSet::default();
-
-        for (path, current_hash) in &current_hashes {
-            match indexed_by_path.get(path) {
-                None => changes.added.push(path.clone()),
-                Some(stored_hash) if stored_hash != current_hash => {
-                    changes.modified.push(path.clone())
-                }
-                Some(_) => {}
-            }
-        }
-
-        let current_paths = current_hashes.keys().cloned().collect::<HashSet<_>>();
-        for path in indexed_by_path.keys() {
-            if !current_paths.contains(path) {
-                changes.deleted.push(path.clone());
-            }
-        }
-
-        changes.normalize();
-        Ok(changes)
-    }
-
     async fn index_one_file<S: IncrementalStorage + ?Sized, E: Embedder + ?Sized>(
         &self,
         ctx: &IndexContext<'_, S, E>,
@@ -298,99 +242,13 @@ impl IncrementalIndexer {
     }
 }
 
-fn is_git_repo(root: &Path) -> bool {
-    git_command(root, ["rev-parse", "--git-dir"]).is_ok()
-}
-
-fn current_commit_sha(root: &Path) -> Result<String> {
-    git_command(root, ["rev-parse", "HEAD"])
-}
-
-fn git_changes(root: &Path, last_sha: &str) -> Result<ChangeSet> {
-    let mut changes = ChangeSet {
-        added: git_diff_paths(root, last_sha, "A")?,
-        modified: git_diff_paths(root, last_sha, "M")?,
-        deleted: git_diff_paths(root, last_sha, "D")?,
-    };
-
-    changes.normalize();
-    Ok(changes)
-}
-
-fn git_diff_paths(root: &Path, last_sha: &str, diff_filter: &str) -> Result<Vec<PathBuf>> {
-    let diff_filter_arg = format!("--diff-filter={diff_filter}");
-    let output = git_command_bytes(
-        root,
-        &[
-            "diff",
-            "--name-only",
-            "--no-renames",
-            diff_filter_arg.as_str(),
-            "-z",
-            last_sha,
-            "HEAD",
-        ],
-    )?;
-
-    output
-        .split(|byte| *byte == 0)
-        .filter(|chunk| !chunk.is_empty())
-        .filter_map(|chunk| {
-            let path = match std::str::from_utf8(chunk) {
-                Ok(path) => PathBuf::from(path),
-                Err(error) => {
-                    return Some(Err(TruesightError::Git(error.to_string())));
-                }
-            };
-
-            if Language::from_path(&path).is_none() {
-                return None;
-            }
-
-            Some(Ok(path))
-        })
-        .collect()
-}
-
-fn git_command_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .map_err(|error| TruesightError::Git(error.to_string()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(TruesightError::Git(if stderr.is_empty() {
-            format!("git command failed: git {}", args.join(" "))
-        } else {
-            stderr
-        }));
-    }
-
-    Ok(output.stdout)
-}
-
-fn git_command<const N: usize>(root: &Path, args: [&str; N]) -> Result<String> {
-    let output = git_command_bytes(root, &args)?;
-
-    String::from_utf8(output)
-        .map(|stdout| stdout.trim().to_string())
-        .map_err(|error| TruesightError::Git(error.to_string()))
-}
-
-fn hash_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path)?;
-    Ok(hash_bytes(&bytes))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::IncrementalIndexer;
+    use super::{IncrementalIndexer, git};
     use crate::repo_context::detect_repo_context;
     use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     use chrono::Utc;
     use tempfile::TempDir;
@@ -535,7 +393,7 @@ mod tests {
             "src/utils.rs",
             "pub fn beta() -> bool { false }\n",
         );
-        git_commit_all(temp.path(), "initial");
+        git::git_commit_all(temp.path(), "initial");
 
         let database = TestStorage::default();
         let indexer = IncrementalIndexer::new();
@@ -566,7 +424,7 @@ mod tests {
             "src/utils.rs",
             "pub fn beta() -> bool { false }\n",
         );
-        git_commit_all(temp.path(), "initial");
+        git::git_commit_all(temp.path(), "initial");
 
         let database = TestStorage::default();
         let indexer = IncrementalIndexer::new();
@@ -594,7 +452,7 @@ mod tests {
             "src/lib.rs",
             "pub fn alpha_v2() -> bool { false }\n",
         );
-        git_commit_all(temp.path(), "modify alpha");
+        git::git_commit_all(temp.path(), "modify alpha");
 
         let changes = indexer
             .detect_changes(temp.path(), &database, &context.repo_id, &context.branch)
@@ -619,7 +477,7 @@ mod tests {
             "src/plain.rs",
             "pub fn beta() -> bool { false }\n",
         );
-        git_commit_all(temp.path(), "initial");
+        git::git_commit_all(temp.path(), "initial");
 
         let database = TestStorage::default();
         let indexer = IncrementalIndexer::new();
@@ -652,7 +510,7 @@ mod tests {
             "src/plain.rs",
             "pub fn beta_v2() -> bool { true }\n",
         );
-        git_commit_all(temp.path(), "modify unicode and spaced paths");
+        git::git_commit_all(temp.path(), "modify unicode and spaced paths");
 
         let changes = indexer
             .detect_changes(temp.path(), &database, &context.repo_id, &context.branch)
@@ -680,7 +538,7 @@ mod tests {
             "src/utils.rs",
             "pub fn beta() -> bool { false }\n",
         );
-        git_commit_all(temp.path(), "initial");
+        git::git_commit_all(temp.path(), "initial");
 
         let database = TestStorage::default();
         let indexer = IncrementalIndexer::new();
@@ -708,7 +566,7 @@ mod tests {
             "src/lib.rs",
             "pub fn alpha_v2() -> bool { false }\n",
         );
-        git_commit_all(temp.path(), "modify alpha");
+        git::git_commit_all(temp.path(), "modify alpha");
 
         let changes = indexer
             .detect_changes(temp.path(), &database, &context.repo_id, &context.branch)
@@ -752,7 +610,7 @@ mod tests {
             "src/utils.rs",
             "pub fn beta() -> bool { false }\n",
         );
-        git_commit_all(temp.path(), "initial");
+        git::git_commit_all(temp.path(), "initial");
 
         let database = TestStorage::default();
         let indexer = IncrementalIndexer::new();
@@ -776,7 +634,7 @@ mod tests {
             .unwrap();
 
         fs::remove_file(temp.path().join("src/utils.rs")).unwrap();
-        git_commit_all(temp.path(), "delete beta");
+        git::git_commit_all(temp.path(), "delete beta");
 
         let changes = indexer
             .detect_changes(temp.path(), &database, &context.repo_id, &context.branch)
@@ -881,39 +739,8 @@ mod tests {
 
     fn git_repo() -> TempDir {
         let temp = TempDir::new().unwrap();
-        run_git(temp.path(), ["init", "-b", "main"]);
+        git::run_git(temp.path(), ["init", "-b", "main"]);
         temp
-    }
-
-    fn git_commit_all(root: &Path, message: &str) {
-        run_git(root, ["add", "."]);
-        let mut command = Command::new("git");
-        command
-            .args(["commit", "-m", message])
-            .current_dir(root)
-            .env("GIT_AUTHOR_NAME", "OpenCode")
-            .env("GIT_AUTHOR_EMAIL", "opencode@example.com")
-            .env("GIT_COMMITTER_NAME", "OpenCode")
-            .env("GIT_COMMITTER_EMAIL", "opencode@example.com");
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "git commit failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn run_git<const N: usize>(root: &Path, args: [&str; N]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 
     fn write_file(root: &Path, relative: &str, contents: &str) {
