@@ -35,6 +35,50 @@ pub(super) const UPSERT_INDEX_METADATA_SQL: &str = r#"
 "#;
 
 impl Database {
+    pub async fn apply_incremental_changes(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        deleted_files: &[PathBuf],
+        units: &[IndexedCodeUnit],
+        indexed_files: &[IndexedFileRecord],
+    ) -> Result<()> {
+        if deleted_files.is_empty() && units.is_empty() && indexed_files.is_empty() {
+            return Ok(());
+        }
+
+        let connection = self.connect().await.map_err(TruesightError::from)?;
+        let transaction = connection
+            .transaction()
+            .await
+            .map_err(DatabaseError::from)?;
+
+        for file_path in deleted_files {
+            delete_file_partition(&transaction, repo_id, branch, file_path).await?;
+        }
+
+        for entry in units {
+            insert_code_unit(&transaction, repo_id, branch, entry)
+                .await
+                .map_err(TruesightError::from)?;
+        }
+
+        for file in indexed_files {
+            upsert_indexed_file_in_transaction(
+                &transaction,
+                repo_id,
+                branch,
+                &file.file_path,
+                &file.file_hash,
+                file.chunk_count,
+            )
+            .await?;
+        }
+
+        transaction.commit().await.map_err(DatabaseError::from)?;
+        Ok(())
+    }
+
     pub async fn store_indexed_units(
         &self,
         repo_id: &str,
@@ -369,6 +413,29 @@ pub(super) async fn delete_branch_partition(
         .execute(
             "DELETE FROM index_metadata WHERE repo_id = ?1 AND branch = ?2",
             params![repo_id, branch],
+        )
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn delete_file_partition(
+    transaction: &libsql::Transaction,
+    repo_id: &str,
+    branch: &str,
+    file_path: &Path,
+) -> std::result::Result<(), DatabaseError> {
+    let file_path = path_to_string(file_path);
+
+    transaction
+        .execute(
+            "DELETE FROM code_units WHERE repo_id = ?1 AND branch = ?2 AND file_path = ?3",
+            params![repo_id, branch, file_path.clone()],
+        )
+        .await?;
+    transaction
+        .execute(
+            "DELETE FROM indexed_files WHERE repo_id = ?1 AND branch = ?2 AND file_path = ?3",
+            params![repo_id, branch, file_path],
         )
         .await?;
     Ok(())

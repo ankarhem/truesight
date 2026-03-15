@@ -352,4 +352,23 @@ impl IncrementalStorage for Database {
             .map_err(|error| TruesightError::Database(error.to_string()))?;
         Ok(())
     }
+
+    async fn apply_incremental_changes(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        deleted_files: &[PathBuf],
+        units: &[IndexedCodeUnit],
+        indexed_files: &[IndexedFileRecord],
+    ) -> Result<()> {
+        Database::apply_incremental_changes(
+            self,
+            repo_id,
+            branch,
+            deleted_files,
+            units,
+            indexed_files,
+        )
+        .await
+    }
 }
