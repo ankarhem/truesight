@@ -58,6 +58,8 @@
               openssl
               onnxruntime
             ];
+
+            meta.mainProgram = "truesight";
           };
         in
         {
